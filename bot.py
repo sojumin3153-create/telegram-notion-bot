@@ -327,8 +327,14 @@ def get_pending_count():
 
 
 def get_status_summary():
-    """상태별 카운트 반환: {'urgent_pending', 'normal_pending', 'hold', 'completed_today'}"""
-    summary = {"urgent_pending": 0, "normal_pending": 0, "hold": 0, "completed_today": 0}
+    """상태별 카운트 반환: {'urgent_pending', 'normal_pending', 'hold', 'completed_today', 'completed_month'}"""
+    summary = {
+        "urgent_pending": 0,
+        "normal_pending": 0,
+        "hold": 0,
+        "completed_today": 0,
+        "completed_month": 0,
+    }
 
     items = get_pending_items()
     if items:
@@ -352,7 +358,8 @@ def get_status_summary():
         summary["hold"] = len(hold_res.json().get("results", []))
 
     # 오늘 업로드 완료 카운트
-    today = datetime.now(KST).strftime("%Y-%m-%d")
+    now_kst = datetime.now(KST)
+    today = now_kst.strftime("%Y-%m-%d")
     done_body = {
         "filter": {
             "and": [
@@ -368,6 +375,24 @@ def get_status_summary():
     )
     if done_res.status_code == 200:
         summary["completed_today"] = len(done_res.json().get("results", []))
+
+    # 이번 달 업로드 완료 카운트
+    month_start = now_kst.strftime("%Y-%m-01")
+    month_body = {
+        "filter": {
+            "and": [
+                {"property": "상태", "select": {"equals": "업로드완료"}},
+                {"timestamp": "last_edited_time", "last_edited_time": {"on_or_after": month_start}},
+            ]
+        },
+    }
+    month_res = requests.post(
+        f"{NOTION_API}/databases/{DATABASE_ID}/query",
+        headers=NOTION_HEADERS,
+        json=month_body,
+    )
+    if month_res.status_code == 200:
+        summary["completed_month"] = len(month_res.json().get("results", []))
 
     return summary
 
@@ -496,15 +521,14 @@ def send_media_group(chat_id, media_items, caption, parse_mode=None):
 
 
 def send_status_summary(chat_id):
-    """상태별 카운트만 빠르게 표시."""
+    """재고 관점 압축형 카운트 표시."""
     s = get_status_summary()
+    stock = s["normal_pending"] + s["hold"]
     lines = []
     if s["urgent_pending"]:
         lines.append(f"🚨 긴급 미완료: {s['urgent_pending']}건")
-    lines.append(f"📋 대기: {s['normal_pending']}건")
-    if s["hold"]:
-        lines.append(f"🚫 보류: {s['hold']}건")
-    lines.append(f"✅ 오늘 완료: {s['completed_today']}건")
+    lines.append(f"📦 재고 {stock}건 (대기 {s['normal_pending']} · 보류 {s['hold']})")
+    lines.append(f"📤 오늘 {s['completed_today']}건 · 이번 달 {s['completed_month']}건")
     send_message(chat_id, "\n".join(lines))
 
 
