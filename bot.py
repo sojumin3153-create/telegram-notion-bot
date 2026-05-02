@@ -357,14 +357,16 @@ def get_status_summary():
     if hold_res.status_code == 200:
         summary["hold"] = len(hold_res.json().get("results", []))
 
-    # 오늘 업로드 완료 카운트
+    # 오늘/이번 달 업로드 완료 카운트 (KST 기준 자정 ISO 8601로 정확히 지정)
     now_kst = datetime.now(KST)
-    today = now_kst.strftime("%Y-%m-%d")
+    today_start = now_kst.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    month_start = now_kst.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+
     done_body = {
         "filter": {
             "and": [
                 {"property": "상태", "select": {"equals": "업로드완료"}},
-                {"timestamp": "last_edited_time", "last_edited_time": {"on_or_after": today}},
+                {"timestamp": "last_edited_time", "last_edited_time": {"on_or_after": today_start}},
             ]
         },
     }
@@ -376,8 +378,6 @@ def get_status_summary():
     if done_res.status_code == 200:
         summary["completed_today"] = len(done_res.json().get("results", []))
 
-    # 이번 달 업로드 완료 카운트
-    month_start = now_kst.strftime("%Y-%m-01")
     month_body = {
         "filter": {
             "and": [
