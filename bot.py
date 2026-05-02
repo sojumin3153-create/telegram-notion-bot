@@ -498,10 +498,10 @@ def send_media_group(chat_id, media_items, caption, parse_mode=None):
 def send_status_summary(chat_id):
     """상태별 카운트만 빠르게 표시."""
     s = get_status_summary()
-    lines = ["📊 현재 상태"]
+    lines = []
     if s["urgent_pending"]:
         lines.append(f"🚨 긴급 미완료: {s['urgent_pending']}건")
-    lines.append(f"📋 일반 미완료: {s['normal_pending']}건")
+    lines.append(f"📋 대기: {s['normal_pending']}건")
     if s["hold"]:
         lines.append(f"🚫 보류: {s['hold']}건")
     lines.append(f"✅ 오늘 완료: {s['completed_today']}건")
