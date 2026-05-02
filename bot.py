@@ -365,7 +365,7 @@ def extract_item_data(item):
     }
 
 
-def send_photo(chat_id, photo_url, caption, reply_markup=None):
+def send_photo(chat_id, photo_url, caption, reply_markup=None, parse_mode=None):
     """텔레그램 URL인 경우 다운로드 후 재업로드."""
     try:
         if photo_url.startswith("https://api.telegram.org/file/"):
@@ -376,11 +376,15 @@ def send_photo(chat_id, photo_url, caption, reply_markup=None):
             data = {"chat_id": str(chat_id), "caption": caption}
             if reply_markup:
                 data["reply_markup"] = json.dumps(reply_markup)
+            if parse_mode:
+                data["parse_mode"] = parse_mode
             res = requests.post(f"{TELEGRAM_API}/sendPhoto", files=files, data=data, timeout=60)
         else:
             payload = {"chat_id": chat_id, "photo": photo_url, "caption": caption}
             if reply_markup:
                 payload["reply_markup"] = reply_markup
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
             res = requests.post(f"{TELEGRAM_API}/sendPhoto", json=payload, timeout=60)
         return res.json().get("result", {}).get("message_id")
     except Exception as e:
@@ -388,7 +392,7 @@ def send_photo(chat_id, photo_url, caption, reply_markup=None):
         return None
 
 
-def send_video(chat_id, video_url, caption, reply_markup=None):
+def send_video(chat_id, video_url, caption, reply_markup=None, parse_mode=None):
     """영상 전송 (텔레그램 URL은 다운로드 후 재업로드)."""
     try:
         if video_url.startswith("https://api.telegram.org/file/"):
@@ -399,11 +403,15 @@ def send_video(chat_id, video_url, caption, reply_markup=None):
             data = {"chat_id": str(chat_id), "caption": caption}
             if reply_markup:
                 data["reply_markup"] = json.dumps(reply_markup)
+            if parse_mode:
+                data["parse_mode"] = parse_mode
             res = requests.post(f"{TELEGRAM_API}/sendVideo", files=files, data=data, timeout=300)
         else:
             payload = {"chat_id": chat_id, "video": video_url, "caption": caption}
             if reply_markup:
                 payload["reply_markup"] = reply_markup
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
             res = requests.post(f"{TELEGRAM_API}/sendVideo", json=payload, timeout=300)
         return res.json().get("result", {}).get("message_id")
     except Exception as e:
@@ -411,7 +419,7 @@ def send_video(chat_id, video_url, caption, reply_markup=None):
         return None
 
 
-def send_media_group(chat_id, media_items, caption):
+def send_media_group(chat_id, media_items, caption, parse_mode=None):
     """여러 사진/영상을 album으로 전송. 첫 항목에만 캡션. 첫 메시지 ID 반환."""
     try:
         files = {}
@@ -427,6 +435,8 @@ def send_media_group(chat_id, media_items, caption):
             item = {"type": mtype, "media": f"attach://{attach_name}"}
             if i == 0:
                 item["caption"] = caption
+                if parse_mode:
+                    item["parse_mode"] = parse_mode
             media.append(item)
         if not media:
             return None
@@ -574,37 +584,45 @@ def send_card(chat_id, media_items, caption_body, page_id, reply_to_message_id=N
     }
     footer = "⚡ 즉시 인스타 업로드 후 버튼 눌러주세요👇" if urgent else "인스타에 올린 후 아래 버튼 눌러주세요👇"
 
+    # 긴급일 경우 캡션 안에 멘션 임베드
+    parse_mode = None
+    if urgent:
+        # 캡션을 HTML로 보내야 멘션 작동. 기존 캡션 HTML 이스케이프 처리.
+        from html import escape as _escape
+        escaped_caption = _escape(caption_body)
+        escaped_footer = _escape(footer)
+        mention = f'<a href="tg://user?id={UPLOADER_USER_ID}">⚡ Song Won</a>님 즉시 확인!'
+        caption_body = f"{escaped_caption}\n\n{mention}"
+        footer = escaped_footer
+        parse_mode = "HTML"
+
     sent_ids = []
     if media_count > 1:
-        album_id = send_media_group(chat_id, media_items, caption_body)
+        album_id = send_media_group(chat_id, media_items, caption_body, parse_mode=parse_mode)
         if album_id:
             sent_ids.append(album_id)
-        button_id = send_message(chat_id, footer, reply_markup=keyboard)
+        # 버튼은 별도 메시지(앨범에는 인라인 버튼 안 됨)
+        button_id = send_message(chat_id, footer, reply_markup=keyboard, parse_mode=parse_mode)
         if button_id:
             sent_ids.append(button_id)
     elif media_count == 1:
         mtype, url = media_items[0]
         full_caption = caption_body + "\n\n" + footer
         if mtype == "video":
-            sid = send_video(chat_id, url, full_caption, keyboard)
+            sid = send_video(chat_id, url, full_caption, keyboard, parse_mode=parse_mode)
         else:
-            sid = send_photo(chat_id, url, full_caption, keyboard)
+            sid = send_photo(chat_id, url, full_caption, keyboard, parse_mode=parse_mode)
         if sid:
             sent_ids.append(sid)
     else:
         full_caption = caption_body + "\n\n" + footer
-        sid = send_message(chat_id, full_caption, reply_to_message_id, keyboard)
+        sid = send_message(chat_id, full_caption, reply_to_message_id, keyboard, parse_mode=parse_mode)
         if sid:
             sent_ids.append(sid)
 
-    # 긴급이면 핀 + 멘션 알림
+    # 긴급이면 메시지 핀
     if urgent and sent_ids:
-        first_msg_id = sent_ids[0]
-        pin_message(chat_id, first_msg_id)
-        mention_html = f'🚨 <a href="tg://user?id={UPLOADER_USER_ID}">긴급</a> 콘텐츠 즉시 확인!'
-        alert_id = send_message(chat_id, mention_html, parse_mode="HTML")
-        if alert_id:
-            sent_ids.append(alert_id)
+        pin_message(chat_id, sent_ids[0])
 
     return sent_ids
 
