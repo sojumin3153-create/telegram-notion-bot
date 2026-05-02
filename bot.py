@@ -42,8 +42,8 @@ media_cache = {}
 LOW_STOCK_THRESHOLD = 5
 last_stock_count = None  # 첫 관측 시 초기화
 
-# 완료/보류 처리된 카드 자동 삭제 추적: {chat_id: {message_id: timer}}
-# 1시간 후 자동 삭제, /대기 호출 시 즉시 정리, ↩ 되돌리기 시 취소
+# 완료 카드 자동 삭제 추적: {chat_id: {message_id: timer}}
+# 보류는 계속 보관 (재작업용), 완료만 1시간 후 자동 삭제 (/대기 시 즉시 정리, ↩ 시 취소)
 completed_cards = {}
 completed_cards_lock = threading.Lock()
 COMPLETED_AUTO_DELETE_DELAY = 3600  # 1시간 (초)
@@ -109,7 +109,7 @@ def cancel_completed_deletion(chat_id, message_id):
 
 
 def clear_all_completed_cards(chat_id):
-    """/대기 호출 시 완료/보류 카드 일괄 삭제 + 타이머 정리."""
+    """/대기 호출 시 완료 카드 일괄 삭제 + 타이머 정리 (보류는 추적 안 됨)."""
     with completed_cards_lock:
         timers = completed_cards.get(chat_id, {})
         message_ids = list(timers.keys())
@@ -750,7 +750,7 @@ def upgrade_to_urgent(chat_id, page_id, bot_card_message_id):
 def send_pending_list(chat_id, max_items=15):
     # 이전 미완료 카드 모두 삭제
     clear_all_pending_cards(chat_id)
-    # 완료/보류 처리된 카드도 함께 정리
+    # 완료 카드도 함께 정리 (보류는 계속 보관)
     clear_all_completed_cards(chat_id)
 
     items = get_pending_items()
@@ -1123,7 +1123,7 @@ def handle_message(message):
                 "✏️ 봇 카드에 새 사진 답장하면 사진 교체\n"
                 "🚨 캡션에 '긴급' 또는 '#긴급' 포함 시 긴급 처리\n"
                 f"📦 재고 {LOW_STOCK_THRESHOLD}건 이하면 자동 알림\n"
-                "🧹 완료/보류 카드는 1시간 후 또는 /대기 시 자동 정리"
+                "🧹 완료 카드는 1시간 후 또는 /대기 시 자동 정리 (보류는 계속 보관)"
             )
             send_message(chat_id, help_text)
             return
@@ -1199,8 +1199,9 @@ def handle_callback_query(callback):
             edit_message(chat_id, message_id, new_text, has_caption, keyboard)
             # 완료/보류 후 재고 변동 체크 (대기→완료 시 재고 -1)
             check_low_stock_alert(chat_id)
-            # 1시간 후 자동 삭제 예약 (/대기 호출 시 즉시 정리됨)
-            schedule_completed_deletion(chat_id, message_id)
+            # 완료만 1시간 후 자동 삭제 예약 (보류는 계속 보관)
+            if not is_hold:
+                schedule_completed_deletion(chat_id, message_id)
         else:
             requests.post(
                 f"{TELEGRAM_API}/answerCallbackQuery",
