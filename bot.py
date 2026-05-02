@@ -42,6 +42,12 @@ media_cache = {}
 LOW_STOCK_THRESHOLD = 5
 last_stock_count = None  # 첫 관측 시 초기화
 
+# 완료/보류 처리된 카드 자동 삭제 추적: {chat_id: {message_id: timer}}
+# 1시간 후 자동 삭제, /대기 호출 시 즉시 정리, ↩ 되돌리기 시 취소
+completed_cards = {}
+completed_cards_lock = threading.Lock()
+COMPLETED_AUTO_DELETE_DELAY = 3600  # 1시간 (초)
+
 
 def register_card(chat_id, page_id, message_ids):
     pending_cards.setdefault(chat_id, {})[page_id] = list(message_ids)
@@ -74,6 +80,44 @@ def clear_all_pending_cards(chat_id):
     for mid in get_all_pending_message_ids(chat_id):
         delete_message(chat_id, mid)
     pending_cards[chat_id] = {}
+
+
+def _delete_completed_card_now(chat_id, message_id):
+    with completed_cards_lock:
+        completed_cards.get(chat_id, {}).pop(message_id, None)
+    delete_message(chat_id, message_id)
+
+
+def schedule_completed_deletion(chat_id, message_id, delay=COMPLETED_AUTO_DELETE_DELAY):
+    """완료/보류 카드를 N초 뒤 자동 삭제 예약."""
+    with completed_cards_lock:
+        existing = completed_cards.get(chat_id, {}).get(message_id)
+        if existing:
+            existing.cancel()
+        timer = threading.Timer(delay, _delete_completed_card_now, args=[chat_id, message_id])
+        timer.daemon = True
+        timer.start()
+        completed_cards.setdefault(chat_id, {})[message_id] = timer
+
+
+def cancel_completed_deletion(chat_id, message_id):
+    """↩ 되돌리기 시 자동 삭제 타이머 취소."""
+    with completed_cards_lock:
+        timer = completed_cards.get(chat_id, {}).pop(message_id, None)
+    if timer:
+        timer.cancel()
+
+
+def clear_all_completed_cards(chat_id):
+    """/대기 호출 시 완료/보류 카드 일괄 삭제 + 타이머 정리."""
+    with completed_cards_lock:
+        timers = completed_cards.get(chat_id, {})
+        message_ids = list(timers.keys())
+        for t in timers.values():
+            t.cancel()
+        completed_cards[chat_id] = {}
+    for mid in message_ids:
+        delete_message(chat_id, mid)
 
 
 def get_updates(offset=None):
@@ -706,6 +750,8 @@ def upgrade_to_urgent(chat_id, page_id, bot_card_message_id):
 def send_pending_list(chat_id, max_items=15):
     # 이전 미완료 카드 모두 삭제
     clear_all_pending_cards(chat_id)
+    # 완료/보류 처리된 카드도 함께 정리
+    clear_all_completed_cards(chat_id)
 
     items = get_pending_items()
 
@@ -1076,7 +1122,8 @@ def handle_message(message):
                 "📤 사진/영상 + 캡션을 보내면 자동 저장\n"
                 "✏️ 봇 카드에 새 사진 답장하면 사진 교체\n"
                 "🚨 캡션에 '긴급' 또는 '#긴급' 포함 시 긴급 처리\n"
-                f"📦 재고 {LOW_STOCK_THRESHOLD}건 이하면 자동 알림"
+                f"📦 재고 {LOW_STOCK_THRESHOLD}건 이하면 자동 알림\n"
+                "🧹 완료/보류 카드는 1시간 후 또는 /대기 시 자동 정리"
             )
             send_message(chat_id, help_text)
             return
@@ -1152,6 +1199,8 @@ def handle_callback_query(callback):
             edit_message(chat_id, message_id, new_text, has_caption, keyboard)
             # 완료/보류 후 재고 변동 체크 (대기→완료 시 재고 -1)
             check_low_stock_alert(chat_id)
+            # 1시간 후 자동 삭제 예약 (/대기 호출 시 즉시 정리됨)
+            schedule_completed_deletion(chat_id, message_id)
         else:
             requests.post(
                 f"{TELEGRAM_API}/answerCallbackQuery",
@@ -1189,6 +1238,8 @@ def handle_callback_query(callback):
             edit_message(chat_id, message_id, new_text, has_caption, keyboard)
             # 되돌리기로 재고가 회복되었을 수 있으므로 트래커 갱신
             check_low_stock_alert(chat_id)
+            # 자동 삭제 예약 취소
+            cancel_completed_deletion(chat_id, message_id)
         else:
             requests.post(
                 f"{TELEGRAM_API}/answerCallbackQuery",
