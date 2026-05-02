@@ -326,6 +326,52 @@ def get_pending_count():
     return len(items) if items is not None else None
 
 
+def get_status_summary():
+    """상태별 카운트 반환: {'urgent_pending', 'normal_pending', 'hold', 'completed_today'}"""
+    summary = {"urgent_pending": 0, "normal_pending": 0, "hold": 0, "completed_today": 0}
+
+    items = get_pending_items()
+    if items:
+        for item in items:
+            prio = item.get("properties", {}).get("우선순위", {}).get("select")
+            if prio and prio.get("name") == "긴급":
+                summary["urgent_pending"] += 1
+            else:
+                summary["normal_pending"] += 1
+
+    # 보류 카운트
+    hold_body = {
+        "filter": {"property": "상태", "select": {"equals": "보류"}},
+    }
+    hold_res = requests.post(
+        f"{NOTION_API}/databases/{DATABASE_ID}/query",
+        headers=NOTION_HEADERS,
+        json=hold_body,
+    )
+    if hold_res.status_code == 200:
+        summary["hold"] = len(hold_res.json().get("results", []))
+
+    # 오늘 업로드 완료 카운트
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    done_body = {
+        "filter": {
+            "and": [
+                {"property": "상태", "select": {"equals": "업로드완료"}},
+                {"timestamp": "last_edited_time", "last_edited_time": {"on_or_after": today}},
+            ]
+        },
+    }
+    done_res = requests.post(
+        f"{NOTION_API}/databases/{DATABASE_ID}/query",
+        headers=NOTION_HEADERS,
+        json=done_body,
+    )
+    if done_res.status_code == 200:
+        summary["completed_today"] = len(done_res.json().get("results", []))
+
+    return summary
+
+
 def extract_item_data(item):
     page_id = item["id"]
     props = item["properties"]
@@ -447,6 +493,19 @@ def send_media_group(chat_id, media_items, caption, parse_mode=None):
     except Exception as e:
         print(f"send_media_group error: {e}")
         return None
+
+
+def send_status_summary(chat_id):
+    """상태별 카운트만 빠르게 표시."""
+    s = get_status_summary()
+    lines = ["📊 현재 상태"]
+    if s["urgent_pending"]:
+        lines.append(f"🚨 긴급 미완료: {s['urgent_pending']}건")
+    lines.append(f"📋 일반 미완료: {s['normal_pending']}건")
+    if s["hold"]:
+        lines.append(f"🚫 보류: {s['hold']}건")
+    lines.append(f"✅ 오늘 완료: {s['completed_today']}건")
+    send_message(chat_id, "\n".join(lines))
 
 
 def send_pending_list(chat_id, max_items=15):
@@ -777,12 +836,18 @@ def handle_message(message):
             delete_message(chat_id, message_id)
             send_pending_list(chat_id)
             return
+        if cmd in ("/개수", "/카운트", "/count", "/현황"):
+            delete_message(chat_id, message_id)
+            send_status_summary(chat_id)
+            return
         if cmd in ("/도움말", "/help"):
             help_text = (
                 "🤖 봇 명령어\n\n"
-                "/대기 - 미완료 게시물 목록 보기\n"
+                "/대기 - 미완료 게시물 전체 목록\n"
+                "/개수 - 상태별 개수 빠르게 확인\n"
                 "/도움말 - 이 메시지\n\n"
-                "사진/영상 + 캡션을 보내면 자동으로 Notion에 저장됩니다."
+                "사진/영상 + 캡션을 보내면 자동으로 Notion에 저장됩니다.\n"
+                "캡션에 '긴급' 또는 '#긴급' 포함 시 긴급 처리."
             )
             send_message(chat_id, help_text)
             return
