@@ -34,6 +34,14 @@ media_group_buffer = {}
 media_group_lock = threading.Lock()
 MEDIA_GROUP_DELAY = 3.0  # 초
 
+# /대기 미디어 캐시: {page_id: (media_type, telegram_file_id)}
+# 같은 사진을 매번 다운로드/업로드하지 않고 file_id로 재사용
+media_cache = {}
+
+# 재고 부족 알림: 재고(대기+보류) ≤ 임계값으로 떨어지면 그룹에 알림
+LOW_STOCK_THRESHOLD = 5
+last_stock_count = None  # 첫 관측 시 초기화
+
 
 def register_card(chat_id, page_id, message_ids):
     pending_cards.setdefault(chat_id, {})[page_id] = list(message_ids)
@@ -532,6 +540,169 @@ def send_status_summary(chat_id):
     send_message(chat_id, "\n".join(lines))
 
 
+def cache_invalidate_media(page_id):
+    """수정 또는 사진 변경 시 캐시 무효화."""
+    media_cache.pop(page_id, None)
+
+
+def send_pending_media_cached(chat_id, page_id, media_type, media_url, caption, keyboard):
+    """/대기 카드 미디어 전송 — file_id 캐시 사용. 반환: message_id."""
+    cached = media_cache.get(page_id)
+    if cached and cached[0] == media_type:
+        endpoint = "sendVideo" if media_type == "video" else "sendPhoto"
+        field = "video" if media_type == "video" else "photo"
+        try:
+            payload = {
+                "chat_id": chat_id,
+                field: cached[1],
+                "caption": caption,
+                "reply_markup": keyboard,
+            }
+            res = requests.post(f"{TELEGRAM_API}/{endpoint}", json=payload, timeout=30)
+            data = res.json()
+            if data.get("ok"):
+                return data.get("result", {}).get("message_id")
+            # 캐시된 file_id가 만료/유효하지 않으면 fall-through
+        except Exception as e:
+            print(f"send_pending_media_cached cache hit error: {e}")
+
+    # 캐시 미스 또는 무효 → URL로 전송 + file_id 저장
+    if media_type == "video":
+        endpoint = "sendVideo"
+        url_field = "video"
+    else:
+        endpoint = "sendPhoto"
+        url_field = "photo"
+
+    try:
+        payload = {
+            "chat_id": chat_id,
+            url_field: media_url,
+            "caption": caption,
+            "reply_markup": keyboard,
+        }
+        res = requests.post(f"{TELEGRAM_API}/{endpoint}", json=payload, timeout=120)
+        result = res.json().get("result", {})
+        message_id = result.get("message_id")
+        if media_type == "video":
+            file_id = result.get("video", {}).get("file_id")
+        else:
+            photos = result.get("photo", [])
+            file_id = photos[-1]["file_id"] if photos else None
+        if file_id:
+            media_cache[page_id] = (media_type, file_id)
+        return message_id
+    except Exception as e:
+        print(f"send_pending_media_cached URL send error: {e}")
+        return None
+
+
+def check_low_stock_alert(chat_id):
+    """재고가 임계값 이하로 떨어지면 알림 (감소 시점에만, 중복 방지)."""
+    global last_stock_count
+    s = get_status_summary()
+    new_stock = s["normal_pending"] + s["hold"]
+
+    should_alert = False
+    if last_stock_count is None:
+        # 첫 관측 — 이미 임계값 이하라면 알림
+        if new_stock <= LOW_STOCK_THRESHOLD:
+            should_alert = True
+    elif last_stock_count > LOW_STOCK_THRESHOLD and new_stock <= LOW_STOCK_THRESHOLD:
+        # 임계값 라인을 넘어 감소
+        should_alert = True
+
+    if should_alert:
+        send_message(
+            chat_id,
+            f"⚠️ 재고 부족 경고\n"
+            f"📦 현재 재고: {new_stock}건 (임계값 {LOW_STOCK_THRESHOLD}건 이하)\n"
+            f"새 콘텐츠 제작이 필요합니다.",
+        )
+
+    last_stock_count = new_stock
+
+
+def search_notion(keyword):
+    """비고/참고링크에서 키워드 검색."""
+    body = {
+        "filter": {
+            "or": [
+                {"property": "비고", "rich_text": {"contains": keyword}},
+                {"property": "참고 링크", "url": {"contains": keyword}},
+            ]
+        },
+        "sorts": [{"timestamp": "created_time", "direction": "descending"}],
+        "page_size": 20,
+    }
+    res = requests.post(
+        f"{NOTION_API}/databases/{DATABASE_ID}/query",
+        headers=NOTION_HEADERS,
+        json=body,
+    )
+    if res.status_code != 200:
+        return None
+    return res.json().get("results", [])
+
+
+def send_search_results(chat_id, keyword, max_items=10):
+    results = search_notion(keyword)
+    if results is None:
+        send_message(chat_id, "❌ 검색 실패")
+        return
+    if not results:
+        send_message(chat_id, f"🔍 '{keyword}' — 결과 없음")
+        return
+
+    send_message(chat_id, f"🔍 '{keyword}' — {len(results)}건")
+
+    status_emoji = {"소재등록": "📋", "업로드완료": "✅", "보류": "🚫"}
+
+    for item in results[:max_items]:
+        data = extract_item_data(item)
+        status_prop = item["properties"].get("상태", {}).get("select")
+        status_name = status_prop.get("name") if status_prop else "?"
+        emoji = status_emoji.get(status_name, "?")
+
+        parts = [f"{emoji} {status_name}"]
+        if data["urgent"]:
+            parts.append("🚨 긴급")
+        parts.append(f"📅 {data['title']}")
+        if data["note"]:
+            parts.append(f"📝 {data['note']}")
+        if data["link"]:
+            parts.append(f"🔗 {data['link']}")
+        caption = "\n".join(parts)
+
+        if data["media_url"]:
+            if data["media_type"] == "video":
+                send_video(chat_id, data["media_url"], caption)
+            else:
+                send_photo(chat_id, data["media_url"], caption)
+        else:
+            send_message(chat_id, caption)
+
+    if len(results) > max_items:
+        send_message(chat_id, f"...외 {len(results) - max_items}건 (Notion에서 확인)")
+
+
+def upgrade_to_urgent(chat_id, page_id, bot_card_message_id):
+    """카드를 긴급으로 승격: Notion 우선순위 변경 + 핀 + 멘션."""
+    body = {"properties": {"우선순위": {"select": {"name": "긴급"}}}}
+    res = requests.patch(f"{NOTION_API}/pages/{page_id}", headers=NOTION_HEADERS, json=body)
+    if res.status_code != 200:
+        return False
+    pin_message(chat_id, bot_card_message_id)
+    mention = f'<a href="tg://user?id={UPLOADER_USER_ID}">⚡ Song Won</a>님 즉시 확인!'
+    send_message(
+        chat_id,
+        f"🚨 긴급으로 승격됨\n{mention}",
+        reply_to_message_id=bot_card_message_id,
+        parse_mode="HTML",
+    )
+    return True
+
+
 def send_pending_list(chat_id, max_items=15):
     # 이전 미완료 카드 모두 삭제
     clear_all_pending_cards(chat_id)
@@ -571,10 +742,14 @@ def send_pending_list(chat_id, max_items=15):
         }
 
         if data["media_url"]:
-            if data["media_type"] == "video":
-                mid = send_video(chat_id, data["media_url"], caption, keyboard)
-            else:
-                mid = send_photo(chat_id, data["media_url"], caption, keyboard)
+            mid = send_pending_media_cached(
+                chat_id,
+                data["page_id"],
+                data["media_type"],
+                data["media_url"],
+                caption,
+                keyboard,
+            )
         else:
             mid = send_message(chat_id, caption, reply_markup=keyboard)
         if mid:
@@ -713,6 +888,7 @@ def send_card(chat_id, media_items, caption_body, page_id, reply_to_message_id=N
 def edit_existing_entry(chat_id, page_id, media_items, text, original_message_ids, old_bot_message):
     """봇 카드에 답장으로 새 사진/영상을 보냈을 때 - 기존 항목 수정."""
     media_items = _normalize_media(media_items)
+    cache_invalidate_media(page_id)  # 사진이 바뀌므로 캐시 무효
     new_link = extract_url(text)
     new_note = parse_caption(text)
     has_new_text = bool(text and text.strip())
@@ -854,7 +1030,8 @@ def handle_message(message):
 
     # 슬래시 명령어 처리
     if text and not has_media:
-        cmd = text.strip().split()[0].lower()
+        stripped = text.strip()
+        cmd = stripped.split()[0].lower()
         cmd = cmd.split("@")[0]
         if cmd in ("/대기", "/list", "/pending", "/start"):
             delete_message(chat_id, message_id)
@@ -864,14 +1041,42 @@ def handle_message(message):
             delete_message(chat_id, message_id)
             send_status_summary(chat_id)
             return
+        if cmd in ("/검색", "/search"):
+            parts = stripped.split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip():
+                send_message(chat_id, "사용법: /검색 키워드", message_id)
+                return
+            keyword = parts[1].strip()
+            delete_message(chat_id, message_id)
+            send_search_results(chat_id, keyword)
+            return
+        if cmd in ("/긴급", "/urgent"):
+            reply_to = message.get("reply_to_message")
+            if not reply_to or not reply_to.get("from", {}).get("is_bot"):
+                send_message(chat_id, "❗️ 봇 카드에 답장으로 사용해주세요.", message_id)
+                return
+            target_page_id = extract_page_id_from_message(reply_to)
+            if not target_page_id:
+                send_message(chat_id, "❗️ 카드를 식별할 수 없습니다.", message_id)
+                return
+            delete_message(chat_id, message_id)
+            ok = upgrade_to_urgent(chat_id, target_page_id, reply_to["message_id"])
+            if not ok:
+                send_message(chat_id, "❌ 긴급 승격 실패")
+            return
         if cmd in ("/도움말", "/help"):
+            delete_message(chat_id, message_id)
             help_text = (
                 "🤖 봇 명령어\n\n"
                 "/대기 - 미완료 게시물 전체 목록\n"
-                "/개수 - 상태별 개수 빠르게 확인\n"
+                "/개수 - 재고 + 발행 카운트\n"
+                "/검색 키워드 - 비고/링크 검색\n"
+                "/긴급 - (카드에 답장) 긴급으로 승격\n"
                 "/도움말 - 이 메시지\n\n"
-                "사진/영상 + 캡션을 보내면 자동으로 Notion에 저장됩니다.\n"
-                "캡션에 '긴급' 또는 '#긴급' 포함 시 긴급 처리."
+                "📤 사진/영상 + 캡션을 보내면 자동 저장\n"
+                "✏️ 봇 카드에 새 사진 답장하면 사진 교체\n"
+                "🚨 캡션에 '긴급' 또는 '#긴급' 포함 시 긴급 처리\n"
+                f"📦 재고 {LOW_STOCK_THRESHOLD}건 이하면 자동 알림"
             )
             send_message(chat_id, help_text)
             return
@@ -945,6 +1150,8 @@ def handle_callback_query(callback):
                 ]
             }
             edit_message(chat_id, message_id, new_text, has_caption, keyboard)
+            # 완료/보류 후 재고 변동 체크 (대기→완료 시 재고 -1)
+            check_low_stock_alert(chat_id)
         else:
             requests.post(
                 f"{TELEGRAM_API}/answerCallbackQuery",
@@ -980,6 +1187,8 @@ def handle_callback_query(callback):
                 ]
             }
             edit_message(chat_id, message_id, new_text, has_caption, keyboard)
+            # 되돌리기로 재고가 회복되었을 수 있으므로 트래커 갱신
+            check_low_stock_alert(chat_id)
         else:
             requests.post(
                 f"{TELEGRAM_API}/answerCallbackQuery",
