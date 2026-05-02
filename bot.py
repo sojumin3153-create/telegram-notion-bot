@@ -13,6 +13,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 ALLOWED_GROUP_ID = int(os.getenv("ALLOWED_GROUP_ID"))
+UPLOADER_USER_ID = int(os.getenv("UPLOADER_USER_ID", "8331369727"))
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 NOTION_API = "https://api.notion.com/v1"
@@ -81,11 +82,25 @@ def extract_url(text):
     return match.group(0) if match else None
 
 
+URGENT_PATTERN = re.compile(r"(?:🚨+|#긴급|\[긴급\]|긴급:)", re.IGNORECASE)
+
+
+def is_urgent(text):
+    return bool(text and URGENT_PATTERN.search(text))
+
+
+def strip_urgent_markers(text):
+    if not text:
+        return text
+    return URGENT_PATTERN.sub("", text).strip()
+
+
 def parse_caption(text):
-    """캡션에서 URL을 제거한 전체 텍스트를 비고로 반환."""
+    """캡션에서 URL과 긴급 마커를 제거한 전체 텍스트를 비고로 반환."""
     if not text:
         return ""
     cleaned = re.sub(r"https?://\S+", "", text)
+    cleaned = URGENT_PATTERN.sub("", cleaned)
     cleaned = re.sub(r"\n{2,}", "\n", cleaned).strip()
     return cleaned
 
@@ -135,13 +150,14 @@ def _normalize_media(media):
     return []
 
 
-def save_to_notion(title, link, media, note=""):
+def save_to_notion(title, link, media, note="", urgent=False):
     """media: [(type, url), ...]. type은 'photo' 또는 'video'."""
     media_items = _normalize_media(media)
 
     properties = {
         "날짜": {"title": [{"text": {"content": title}}]},
         "상태": {"select": {"name": "소재등록"}},
+        "우선순위": {"select": {"name": "긴급" if urgent else "보통"}},
     }
     if link:
         properties["참고 링크"] = {"url": link}
@@ -290,7 +306,14 @@ def get_pending_items():
     )
     if res.status_code != 200:
         return None
-    return res.json().get("results", [])
+    items = res.json().get("results", [])
+    # 긴급 항목을 위로 정렬
+    def urgent_key(item):
+        prio = item.get("properties", {}).get("우선순위", {}).get("select")
+        is_urgent_item = prio and prio.get("name") == "긴급"
+        return (0 if is_urgent_item else 1, item.get("created_time", ""))
+    items.sort(key=urgent_key)
+    return items
 
 
 def get_pending_count():
@@ -310,6 +333,9 @@ def extract_item_data(item):
     note_prop = props.get("비고", {}).get("rich_text", [])
     note = note_prop[0]["plain_text"] if note_prop else ""
 
+    prio = props.get("우선순위", {}).get("select")
+    urgent = bool(prio and prio.get("name") == "긴급")
+
     media_url = None
     media_type = "photo"
     files = props.get("사진", {}).get("files", [])
@@ -328,6 +354,7 @@ def extract_item_data(item):
         "title": title,
         "link": link,
         "note": note,
+        "urgent": urgent,
         "media_url": media_url,
         "media_type": media_type,
     }
@@ -426,7 +453,10 @@ def send_pending_list(chat_id, max_items=15):
 
     for item in items[:max_items]:
         data = extract_item_data(item)
-        caption_parts = [f"📅 {data['title']}"]
+        caption_parts = []
+        if data["urgent"]:
+            caption_parts.append("🚨 긴급")
+        caption_parts.append(f"📅 {data['title']}")
         if data["note"]:
             caption_parts.append(f"📝 {data['note']}")
         if data["link"]:
@@ -456,17 +486,34 @@ def send_pending_list(chat_id, max_items=15):
         send_message(chat_id, f"...외 {count - max_items}건 더 있음 (Notion에서 확인)")
 
 
-def send_message(chat_id, text, reply_to_message_id=None, reply_markup=None):
+def send_message(chat_id, text, reply_to_message_id=None, reply_markup=None, parse_mode=None):
     payload = {"chat_id": chat_id, "text": text}
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
     if reply_markup:
         payload["reply_markup"] = reply_markup
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     res = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload)
     try:
         return res.json().get("result", {}).get("message_id")
     except Exception:
         return None
+
+
+def pin_message(chat_id, message_id, disable_notification=False):
+    try:
+        requests.post(
+            f"{TELEGRAM_API}/pinChatMessage",
+            json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "disable_notification": disable_notification,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"pin_message error: {e}")
 
 
 def delete_message(chat_id, message_id):
@@ -492,8 +539,12 @@ def send_complete_button_reply(chat_id, text, reply_to_message_id, page_id):
     return send_message(chat_id, text, reply_to_message_id, keyboard)
 
 
-def build_card_caption(title, media_count, note, link, has_video=False):
-    parts = [f"📅 {title}"]
+def build_card_caption(title, media_count, note, link, has_video=False, urgent=False):
+    parts = []
+    if urgent:
+        parts.append("🚨🚨🚨 긴급 콘텐츠 🚨🚨🚨")
+        parts.append("")
+    parts.append(f"📅 {title}")
     if media_count > 1:
         label = "미디어" if has_video else "사진"
         parts.append(f"🖼 {label} {media_count}개")
@@ -504,7 +555,7 @@ def build_card_caption(title, media_count, note, link, has_video=False):
     return "\n".join(parts)
 
 
-def send_card(chat_id, media_items, caption_body, page_id, reply_to_message_id=None):
+def send_card(chat_id, media_items, caption_body, page_id, reply_to_message_id=None, urgent=False):
     """봇 카드 전송. media_items: [(type, url), ...]. 보낸 메시지 ID 리스트 반환."""
     media_items = _normalize_media(media_items)
     media_count = len(media_items)
@@ -516,17 +567,19 @@ def send_card(chat_id, media_items, caption_body, page_id, reply_to_message_id=N
             ]
         ]
     }
+    footer = "⚡ 즉시 인스타 업로드 후 버튼 눌러주세요👇" if urgent else "인스타에 올린 후 아래 버튼 눌러주세요👇"
+
     sent_ids = []
     if media_count > 1:
         album_id = send_media_group(chat_id, media_items, caption_body)
         if album_id:
             sent_ids.append(album_id)
-        button_id = send_message(chat_id, "인스타 업로드 후 아래 버튼 눌러주세요👇", reply_markup=keyboard)
+        button_id = send_message(chat_id, footer, reply_markup=keyboard)
         if button_id:
             sent_ids.append(button_id)
     elif media_count == 1:
         mtype, url = media_items[0]
-        full_caption = caption_body + "\n\n인스타에 올린 후 아래 버튼 눌러주세요👇"
+        full_caption = caption_body + "\n\n" + footer
         if mtype == "video":
             sid = send_video(chat_id, url, full_caption, keyboard)
         else:
@@ -534,10 +587,20 @@ def send_card(chat_id, media_items, caption_body, page_id, reply_to_message_id=N
         if sid:
             sent_ids.append(sid)
     else:
-        full_caption = caption_body + "\n\n인스타에 올린 후 아래 버튼 눌러주세요👇"
+        full_caption = caption_body + "\n\n" + footer
         sid = send_message(chat_id, full_caption, reply_to_message_id, keyboard)
         if sid:
             sent_ids.append(sid)
+
+    # 긴급이면 핀 + 멘션 알림
+    if urgent and sent_ids:
+        first_msg_id = sent_ids[0]
+        pin_message(chat_id, first_msg_id)
+        mention_html = f'🚨 <a href="tg://user?id={UPLOADER_USER_ID}">긴급</a> 콘텐츠 즉시 확인!'
+        alert_id = send_message(chat_id, mention_html, parse_mode="HTML")
+        if alert_id:
+            sent_ids.append(alert_id)
+
     return sent_ids
 
 
@@ -586,6 +649,7 @@ def edit_existing_entry(chat_id, page_id, media_items, text, original_message_id
 def save_and_reply(chat_id, media_items, text, original_message_ids):
     """사진/영상 또는 링크를 Notion에 저장하고 봇이 카드로 답장."""
     media_items = _normalize_media(media_items)
+    urgent = is_urgent(text)
     link = extract_url(text)
     note = parse_caption(text)
     title = make_title()
@@ -593,7 +657,7 @@ def save_and_reply(chat_id, media_items, text, original_message_ids):
     if not media_items and not link:
         return
 
-    success, result = save_to_notion(title, link, media_items, note)
+    success, result = save_to_notion(title, link, media_items, note, urgent=urgent)
     if not success:
         print(f"Notion error: {result}")
         if original_message_ids:
@@ -603,10 +667,10 @@ def save_and_reply(chat_id, media_items, text, original_message_ids):
     page_id = result
     media_count = len(media_items)
     has_video = any(m[0] == "video" for m in media_items)
-    caption_body = build_card_caption(title, media_count, note, link, has_video)
+    caption_body = build_card_caption(title, media_count, note, link, has_video, urgent)
 
     reply_to = original_message_ids[0] if original_message_ids else None
-    sent_ids = send_card(chat_id, media_items, caption_body, page_id, reply_to)
+    sent_ids = send_card(chat_id, media_items, caption_body, page_id, reply_to, urgent=urgent)
 
     for mid in original_message_ids:
         delete_message(chat_id, mid)
