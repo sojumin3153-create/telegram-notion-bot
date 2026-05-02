@@ -82,7 +82,12 @@ def extract_url(text):
     return match.group(0) if match else None
 
 
-URGENT_PATTERN = re.compile(r"(?:🚨+|#긴급|\[긴급\]|긴급:)", re.IGNORECASE)
+# 긴급 마커 인식: 🚨, #긴급, [긴급], 긴급:, 또는 단독 단어 "긴급"
+# 단독 "긴급"은 앞뒤에 공백/개행/문자열 시작/끝이 와야 함 (예: "긴급재난" 같은 단어 일부는 무시)
+URGENT_PATTERN = re.compile(
+    r"(?:🚨+|#긴급|\[긴급\]|긴급:|(?:^|\s)긴급(?=\s|$))",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def is_urgent(text):
