@@ -42,11 +42,15 @@ media_cache = {}
 LOW_STOCK_THRESHOLD = 5
 last_stock_count = None  # 첫 관측 시 초기화
 
-# 완료 카드 자동 삭제 추적: {chat_id: {message_id: timer}}
+# 완료 카드 자동 삭제 추적: {chat_id: {page_id: {"message_id": int, "timer": Timer}}}
 # 보류는 계속 보관 (재작업용), 완료만 1시간 후 자동 삭제 (/대기 시 즉시 정리, ↩ 시 취소)
 completed_cards = {}
 completed_cards_lock = threading.Lock()
 COMPLETED_AUTO_DELETE_DELAY = 3600  # 1시간 (초)
+
+# 보류 카드 추적: {chat_id: {page_id: [message_ids]}}
+# /복구가 이미 표시 중인 카드를 중복 등록하지 않도록 사용
+hold_cards = {}
 
 
 def register_card(chat_id, page_id, message_ids):
@@ -67,6 +71,8 @@ def delete_and_unregister_card(chat_id, page_id):
     for mid in msgs:
         delete_message(chat_id, mid)
     unregister_card(chat_id, page_id)
+    # 보류 추적도 함께 정리 (/수정으로 보류 카드 교체 시 스테일 방지)
+    unregister_hold_card(chat_id, page_id)
 
 
 def get_all_pending_message_ids(chat_id):
@@ -82,42 +88,67 @@ def clear_all_pending_cards(chat_id):
     pending_cards[chat_id] = {}
 
 
-def _delete_completed_card_now(chat_id, message_id):
+def _delete_completed_card_now(chat_id, page_id):
     with completed_cards_lock:
-        completed_cards.get(chat_id, {}).pop(message_id, None)
-    delete_message(chat_id, message_id)
+        entry = completed_cards.get(chat_id, {}).pop(page_id, None)
+    if entry:
+        delete_message(chat_id, entry["message_id"])
 
 
-def schedule_completed_deletion(chat_id, message_id, delay=COMPLETED_AUTO_DELETE_DELAY):
-    """완료/보류 카드를 N초 뒤 자동 삭제 예약."""
+def schedule_completed_deletion(chat_id, page_id, message_id, delay=COMPLETED_AUTO_DELETE_DELAY):
+    """완료 카드를 N초 뒤 자동 삭제 예약."""
     with completed_cards_lock:
-        existing = completed_cards.get(chat_id, {}).get(message_id)
+        existing = completed_cards.get(chat_id, {}).get(page_id)
         if existing:
-            existing.cancel()
-        timer = threading.Timer(delay, _delete_completed_card_now, args=[chat_id, message_id])
+            existing["timer"].cancel()
+        timer = threading.Timer(delay, _delete_completed_card_now, args=[chat_id, page_id])
         timer.daemon = True
         timer.start()
-        completed_cards.setdefault(chat_id, {})[message_id] = timer
+        completed_cards.setdefault(chat_id, {})[page_id] = {
+            "message_id": message_id,
+            "timer": timer,
+        }
 
 
-def cancel_completed_deletion(chat_id, message_id):
-    """↩ 되돌리기 시 자동 삭제 타이머 취소."""
+def cancel_completed_deletion(chat_id, page_id):
+    """↩ 되돌리기 / 폐기 시 자동 삭제 타이머 취소."""
     with completed_cards_lock:
-        timer = completed_cards.get(chat_id, {}).pop(message_id, None)
-    if timer:
-        timer.cancel()
+        entry = completed_cards.get(chat_id, {}).pop(page_id, None)
+    if entry:
+        entry["timer"].cancel()
 
 
 def clear_all_completed_cards(chat_id):
     """/대기 호출 시 완료 카드 일괄 삭제 + 타이머 정리 (보류는 추적 안 됨)."""
     with completed_cards_lock:
-        timers = completed_cards.get(chat_id, {})
-        message_ids = list(timers.keys())
-        for t in timers.values():
-            t.cancel()
+        cards = completed_cards.get(chat_id, {})
+        snapshot = list(cards.values())
+        for entry in snapshot:
+            entry["timer"].cancel()
         completed_cards[chat_id] = {}
-    for mid in message_ids:
-        delete_message(chat_id, mid)
+    for entry in snapshot:
+        delete_message(chat_id, entry["message_id"])
+
+
+def register_hold_card(chat_id, page_id, message_ids):
+    """🚫 보류 시 추적 — /복구가 중복 등록하지 않도록."""
+    hold_cards.setdefault(chat_id, {})[page_id] = list(message_ids)
+
+
+def unregister_hold_card(chat_id, page_id):
+    """↩ 되돌리기 / 🗑 폐기 시 보류 추적 해제."""
+    if chat_id in hold_cards:
+        hold_cards[chat_id].pop(page_id, None)
+
+
+def get_visible_page_ids(chat_id):
+    """현재 채팅에서 봇이 추적 중인 모든 카드의 page_id (소재등록 + 보류 + 완료대기)."""
+    visible = set()
+    visible.update(pending_cards.get(chat_id, {}).keys())
+    visible.update(hold_cards.get(chat_id, {}).keys())
+    with completed_cards_lock:
+        visible.update(completed_cards.get(chat_id, {}).keys())
+    return visible
 
 
 def get_updates(offset=None):
@@ -766,11 +797,8 @@ def upgrade_to_urgent(chat_id, page_id, bot_card_message_id):
 
 def send_full_recovery(chat_id, max_items_per_kind=30):
     """전체 복구: 소재등록 + 보류 카드를 Notion에서 다시 채팅에 등록.
-    채팅방 메시지 삭제/재입장/봇 재시작 후 사용."""
-    # 메모리 추적 정리 (스테일 메시지 ID는 무효 → 안전하게 초기화)
-    clear_all_pending_cards(chat_id)
-    clear_all_completed_cards(chat_id)
-
+    이미 채팅에 표시 중인 카드는 스킵 (중복 방지).
+    채팅방 메시지 삭제/재입장 후 사용 권장."""
     body = {
         "filter": {
             "property": "상태",
@@ -792,9 +820,21 @@ def send_full_recovery(chat_id, max_items_per_kind=30):
         send_message(chat_id, "🎉 복구할 카드가 없습니다. (전부 업로드 완료 상태)")
         return
 
+    # 이미 채팅에 표시 중인 카드는 스킵
+    already_visible = get_visible_page_ids(chat_id)
+    new_items = [i for i in items if i["id"] not in already_visible]
+    skipped = len(items) - len(new_items)
+
+    if not new_items:
+        send_message(
+            chat_id,
+            f"🎉 모든 카드가 이미 표시 중입니다 ({skipped}건 스킵)",
+        )
+        return
+
     pending_items = []
     hold_items = []
-    for item in items:
+    for item in new_items:
         status_prop = item["properties"].get("상태", {}).get("select")
         status_name = status_prop.get("name") if status_prop else ""
         if status_name == "보류":
@@ -810,10 +850,10 @@ def send_full_recovery(chat_id, max_items_per_kind=30):
 
     pending_items.sort(key=urgent_key)
 
-    send_message(
-        chat_id,
-        f"🔄 복구 시작\n📋 소재등록 {len(pending_items)}건 · 🚫 보류 {len(hold_items)}건",
-    )
+    header = f"🔄 복구\n📋 소재등록 {len(pending_items)}건 · 🚫 보류 {len(hold_items)}건"
+    if skipped:
+        header += f"\n(이미 표시 중 {skipped}건 스킵)"
+    send_message(chat_id, header)
 
     # 소재등록 카드
     for item in pending_items[:max_items_per_kind]:
@@ -849,7 +889,7 @@ def send_full_recovery(chat_id, max_items_per_kind=30):
         if mid:
             register_card(chat_id, data["page_id"], [mid])
 
-    # 보류 카드 — 별도 추적 안 함 (기존 흐름과 동일)
+    # 보류 카드 — hold_cards에 등록 (다음 /복구 시 중복 방지)
     for item in hold_items[:max_items_per_kind]:
         data = extract_item_data(item)
         caption_parts = ["🚫 보류 상태"]
@@ -868,7 +908,7 @@ def send_full_recovery(chat_id, max_items_per_kind=30):
             ]
         }
         if data["media_url"]:
-            send_pending_media_cached(
+            mid = send_pending_media_cached(
                 chat_id,
                 data["page_id"],
                 data["media_type"],
@@ -877,7 +917,9 @@ def send_full_recovery(chat_id, max_items_per_kind=30):
                 keyboard,
             )
         else:
-            send_message(chat_id, caption, reply_markup=keyboard)
+            mid = send_message(chat_id, caption, reply_markup=keyboard)
+        if mid:
+            register_hold_card(chat_id, data["page_id"], [mid])
 
     truncated = []
     if len(pending_items) > max_items_per_kind:
@@ -1357,9 +1399,11 @@ def handle_callback_query(callback):
             edit_message(chat_id, message_id, new_text, has_caption, keyboard)
             # 완료/보류 후 재고 변동 체크 (대기→완료 시 재고 -1)
             check_low_stock_alert(chat_id)
-            # 완료만 1시간 후 자동 삭제 예약 (보류는 계속 보관)
-            if not is_hold:
-                schedule_completed_deletion(chat_id, message_id)
+            # 완료는 1시간 후 자동 삭제, 보류는 계속 추적 (둘 다 /복구 중복 방지용 추적)
+            if is_hold:
+                register_hold_card(chat_id, page_id, [message_id])
+            else:
+                schedule_completed_deletion(chat_id, page_id, message_id)
         else:
             requests.post(
                 f"{TELEGRAM_API}/answerCallbackQuery",
@@ -1397,8 +1441,9 @@ def handle_callback_query(callback):
             edit_message(chat_id, message_id, new_text, has_caption, keyboard)
             # 되돌리기로 재고가 회복되었을 수 있으므로 트래커 갱신
             check_low_stock_alert(chat_id)
-            # 자동 삭제 예약 취소
-            cancel_completed_deletion(chat_id, message_id)
+            # 자동 삭제 예약 취소 + 보류 추적 해제 (어느 상태에서 왔든 안전)
+            cancel_completed_deletion(chat_id, page_id)
+            unregister_hold_card(chat_id, page_id)
         else:
             requests.post(
                 f"{TELEGRAM_API}/answerCallbackQuery",
@@ -1438,7 +1483,8 @@ def handle_callback_query(callback):
             # 텔레그램 카드 삭제 + 추적/캐시 정리
             delete_message(chat_id, message_id)
             unregister_card(chat_id, page_id)
-            cancel_completed_deletion(chat_id, message_id)
+            unregister_hold_card(chat_id, page_id)
+            cancel_completed_deletion(chat_id, page_id)
             cache_invalidate_media(page_id)
         else:
             requests.post(
