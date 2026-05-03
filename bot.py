@@ -52,6 +52,9 @@ COMPLETED_AUTO_DELETE_DELAY = 3600  # 1시간 (초)
 # /복구가 이미 표시 중인 카드를 중복 등록하지 않도록 사용
 hold_cards = {}
 
+# 매일 9시 알림: 직전 알림 메시지 ID 추적 (다음날 알림 도착 시 자동 삭제)
+last_daily_notification_msg_id = None
+
 
 def register_card(chat_id, page_id, message_ids):
     pending_cards.setdefault(chat_id, {})[page_id] = list(message_ids)
@@ -1620,19 +1623,28 @@ def handle_callback_query(callback):
 
 
 def send_daily_summary():
+    global last_daily_notification_msg_id
     count = get_pending_count()
     if count is None:
         print("Daily summary: failed to fetch count")
         return
+
+    # 직전 알림이 있으면 먼저 삭제 (다음날 도착 시점에 어제 알림 정리)
+    if last_daily_notification_msg_id:
+        delete_message(ALLOWED_GROUP_ID, last_daily_notification_msg_id)
+        last_daily_notification_msg_id = None
+
     if count == 0:
-        text = "☀️ 좋은 아침!\n오늘 미완료 게시물이 없습니다 🎉"
+        text = "☀️ 좋은 아침!\n오늘 재고가 없습니다 🎉"
     else:
         text = (
             f"☀️ 좋은 아침!\n"
-            f"미완료 게시물: {count}건\n\n"
+            f"재고: {count}건\n\n"
             f"📋 확인하기: {NOTION_DB_URL}"
         )
-    send_message(ALLOWED_GROUP_ID, text)
+    msg_id = send_message(ALLOWED_GROUP_ID, text)
+    if msg_id:
+        last_daily_notification_msg_id = msg_id
 
 
 def daily_scheduler():
