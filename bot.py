@@ -764,6 +764,130 @@ def upgrade_to_urgent(chat_id, page_id, bot_card_message_id):
     return True
 
 
+def send_full_recovery(chat_id, max_items_per_kind=30):
+    """전체 복구: 소재등록 + 보류 카드를 Notion에서 다시 채팅에 등록.
+    채팅방 메시지 삭제/재입장/봇 재시작 후 사용."""
+    # 메모리 추적 정리 (스테일 메시지 ID는 무효 → 안전하게 초기화)
+    clear_all_pending_cards(chat_id)
+    clear_all_completed_cards(chat_id)
+
+    body = {
+        "filter": {
+            "property": "상태",
+            "select": {"does_not_equal": "업로드완료"},
+        },
+        "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
+    }
+    res = requests.post(
+        f"{NOTION_API}/databases/{DATABASE_ID}/query",
+        headers=NOTION_HEADERS,
+        json=body,
+    )
+    if res.status_code != 200:
+        send_message(chat_id, "❌ Notion 조회 실패")
+        return
+    items = res.json().get("results", [])
+
+    if not items:
+        send_message(chat_id, "🎉 복구할 카드가 없습니다. (전부 업로드 완료 상태)")
+        return
+
+    pending_items = []
+    hold_items = []
+    for item in items:
+        status_prop = item["properties"].get("상태", {}).get("select")
+        status_name = status_prop.get("name") if status_prop else ""
+        if status_name == "보류":
+            hold_items.append(item)
+        else:
+            pending_items.append(item)
+
+    # 소재등록 — 긴급 우선, 그 다음 오래된 순
+    def urgent_key(item):
+        prio = item.get("properties", {}).get("우선순위", {}).get("select")
+        is_urgent = prio and prio.get("name") == "긴급"
+        return (0 if is_urgent else 1, item.get("created_time", ""))
+
+    pending_items.sort(key=urgent_key)
+
+    send_message(
+        chat_id,
+        f"🔄 복구 시작\n📋 소재등록 {len(pending_items)}건 · 🚫 보류 {len(hold_items)}건",
+    )
+
+    # 소재등록 카드
+    for item in pending_items[:max_items_per_kind]:
+        data = extract_item_data(item)
+        caption_parts = []
+        if data["urgent"]:
+            caption_parts.append("🚨 긴급")
+        caption_parts.append(f"📅 {data['title']}")
+        if data["note"]:
+            caption_parts.append(f"📝 {data['note']}")
+        if data["link"]:
+            caption_parts.append(f"🔗 {data['link']}")
+        caption = "\n".join(caption_parts)
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ 업로드 완료", "callback_data": f"complete:{data['page_id']}"},
+                    {"text": "🚫 보류", "callback_data": f"hold:{data['page_id']}"},
+                ]
+            ]
+        }
+        if data["media_url"]:
+            mid = send_pending_media_cached(
+                chat_id,
+                data["page_id"],
+                data["media_type"],
+                data["media_url"],
+                caption,
+                keyboard,
+            )
+        else:
+            mid = send_message(chat_id, caption, reply_markup=keyboard)
+        if mid:
+            register_card(chat_id, data["page_id"], [mid])
+
+    # 보류 카드 — 별도 추적 안 함 (기존 흐름과 동일)
+    for item in hold_items[:max_items_per_kind]:
+        data = extract_item_data(item)
+        caption_parts = ["🚫 보류 상태"]
+        caption_parts.append(f"📅 {data['title']}")
+        if data["note"]:
+            caption_parts.append(f"📝 {data['note']}")
+        if data["link"]:
+            caption_parts.append(f"🔗 {data['link']}")
+        caption = "\n".join(caption_parts)
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "↩ 되돌리기", "callback_data": f"undo:{data['page_id']}"},
+                    {"text": "🗑 폐기", "callback_data": f"discard:{data['page_id']}"},
+                ]
+            ]
+        }
+        if data["media_url"]:
+            send_pending_media_cached(
+                chat_id,
+                data["page_id"],
+                data["media_type"],
+                data["media_url"],
+                caption,
+                keyboard,
+            )
+        else:
+            send_message(chat_id, caption, reply_markup=keyboard)
+
+    truncated = []
+    if len(pending_items) > max_items_per_kind:
+        truncated.append(f"소재등록 {len(pending_items) - max_items_per_kind}건")
+    if len(hold_items) > max_items_per_kind:
+        truncated.append(f"보류 {len(hold_items) - max_items_per_kind}건")
+    if truncated:
+        send_message(chat_id, f"...외 {' · '.join(truncated)} 더 있음 (Notion에서 확인)")
+
+
 def send_pending_list(chat_id, max_items=15):
     # 이전 미완료 카드 모두 삭제
     clear_all_pending_cards(chat_id)
@@ -1100,6 +1224,10 @@ def handle_message(message):
             delete_message(chat_id, message_id)
             send_pending_list(chat_id)
             return
+        if cmd in ("/복구", "/recover", "/restore"):
+            delete_message(chat_id, message_id)
+            send_full_recovery(chat_id)
+            return
         if cmd in ("/개수", "/카운트", "/count", "/현황"):
             delete_message(chat_id, message_id)
             send_status_summary(chat_id)
@@ -1135,6 +1263,7 @@ def handle_message(message):
                 "/개수 - 재고 + 발행 카운트\n"
                 "/검색 키워드 - 비고/링크 검색\n"
                 "/긴급 - (카드에 답장) 긴급으로 승격\n"
+                "/복구 - 채팅 비운 후 소재등록+보류 재등록\n"
                 "/도움말 - 이 메시지\n\n"
                 "📤 사진/영상 + 캡션을 보내면 자동 저장\n"
                 "✏️ 봇 카드에 새 사진 답장하면 사진 교체\n"
