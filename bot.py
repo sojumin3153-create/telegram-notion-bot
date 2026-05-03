@@ -512,18 +512,26 @@ def extract_item_data(item):
     prio = props.get("우선순위", {}).get("select")
     urgent = bool(prio and prio.get("name") == "긴급")
 
-    media_url = None
-    media_type = "photo"
+    media_items = []
     files = props.get("사진", {}).get("files", [])
-    if files:
-        f = files[0]
+    for f in files:
         name = f.get("name", "").lower()
-        if name.endswith((".mp4", ".mov", ".webm")) or "video" in name:
-            media_type = "video"
+        is_video = name.endswith((".mp4", ".mov", ".webm")) or "video" in name
+        mtype = "video" if is_video else "photo"
         if f.get("type") == "external":
-            media_url = f.get("external", {}).get("url")
+            url = f.get("external", {}).get("url")
         elif f.get("type") == "file":
-            media_url = f.get("file", {}).get("url")
+            url = f.get("file", {}).get("url")
+        else:
+            url = None
+        if url:
+            media_items.append((mtype, url))
+
+    # /대기 호환용: 첫 번째 미디어만 사용
+    if media_items:
+        media_type, media_url = media_items[0]
+    else:
+        media_type, media_url = "photo", None
 
     return {
         "page_id": page_id,
@@ -533,6 +541,7 @@ def extract_item_data(item):
         "urgent": urgent,
         "media_url": media_url,
         "media_type": media_type,
+        "media_items": media_items,
     }
 
 
@@ -871,51 +880,42 @@ def send_full_recovery(chat_id, max_items_per_kind=30):
         header += f"\n(이미 표시 중 {skipped}건 스킵)"
     send_message(chat_id, header)
 
-    # 소재등록 카드
+    # 소재등록 카드 — send_card로 멀티미디어/긴급/버튼 자동 처리
     for item in pending_items[:max_items_per_kind]:
         data = extract_item_data(item)
-        caption_parts = []
-        if data["urgent"]:
-            caption_parts.append("🚨 긴급")
-        caption_parts.append(f"📅 {data['title']}")
-        if data["note"]:
-            caption_parts.append(f"📝 {data['note']}")
-        if data["link"]:
-            caption_parts.append(f"🔗 {data['link']}")
-        caption = "\n".join(caption_parts)
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "✅ 업로드 완료", "callback_data": f"complete:{data['page_id']}"},
-                    {"text": "🚫 보류", "callback_data": f"hold:{data['page_id']}"},
-                ]
-            ]
-        }
-        if data["media_url"]:
-            mid = send_pending_media_cached(
-                chat_id,
-                data["page_id"],
-                data["media_type"],
-                data["media_url"],
-                caption,
-                keyboard,
-            )
-        else:
-            mid = send_message(chat_id, caption, reply_markup=keyboard)
-        if mid:
-            register_card(chat_id, data["page_id"], [mid])
+        media_items_list = data["media_items"]
+        has_video = any(m[0] == "video" for m in media_items_list)
+        caption_body = build_card_caption(
+            data["title"],
+            len(media_items_list),
+            data["note"],
+            data["link"],
+            has_video=has_video,
+            urgent=data["urgent"],
+        )
+        sent_ids = send_card(
+            chat_id,
+            media_items_list,
+            caption_body,
+            data["page_id"],
+            urgent=data["urgent"],
+        )
+        if sent_ids:
+            register_card(chat_id, data["page_id"], sent_ids)
 
-    # 보류 카드 — hold_cards에 등록 (다음 /복구 시 중복 방지)
+    # 보류 카드 — 보류용 버튼/푸터로 send_card 사용
     for item in hold_items[:max_items_per_kind]:
         data = extract_item_data(item)
-        caption_parts = ["🚫 보류 상태"]
-        caption_parts.append(f"📅 {data['title']}")
-        if data["note"]:
-            caption_parts.append(f"📝 {data['note']}")
-        if data["link"]:
-            caption_parts.append(f"🔗 {data['link']}")
-        caption = "\n".join(caption_parts)
-        keyboard = {
+        media_items_list = data["media_items"]
+        has_video = any(m[0] == "video" for m in media_items_list)
+        caption_body = "🚫 보류 상태\n" + build_card_caption(
+            data["title"],
+            len(media_items_list),
+            data["note"],
+            data["link"],
+            has_video=has_video,
+        )
+        hold_keyboard = {
             "inline_keyboard": [
                 [
                     {"text": "↩ 되돌리기", "callback_data": f"undo:{data['page_id']}"},
@@ -923,19 +923,16 @@ def send_full_recovery(chat_id, max_items_per_kind=30):
                 ]
             ]
         }
-        if data["media_url"]:
-            mid = send_pending_media_cached(
-                chat_id,
-                data["page_id"],
-                data["media_type"],
-                data["media_url"],
-                caption,
-                keyboard,
-            )
-        else:
-            mid = send_message(chat_id, caption, reply_markup=keyboard)
-        if mid:
-            register_hold_card(chat_id, data["page_id"], [mid])
+        sent_ids = send_card(
+            chat_id,
+            media_items_list,
+            caption_body,
+            data["page_id"],
+            keyboard=hold_keyboard,
+            footer="📌 재작업 또는 폐기",
+        )
+        if sent_ids:
+            register_hold_card(chat_id, data["page_id"], sent_ids)
 
     truncated = []
     if len(pending_items) > max_items_per_kind:
@@ -1073,19 +1070,25 @@ def build_card_caption(title, media_count, note, link, has_video=False, urgent=F
     return "\n".join(parts)
 
 
-def send_card(chat_id, media_items, caption_body, page_id, reply_to_message_id=None, urgent=False):
-    """봇 카드 전송. media_items: [(type, url), ...]. 보낸 메시지 ID 리스트 반환."""
+def send_card(chat_id, media_items, caption_body, page_id, reply_to_message_id=None,
+              urgent=False, keyboard=None, footer=None):
+    """봇 카드 전송. media_items: [(type, url), ...]. 보낸 메시지 ID 리스트 반환.
+
+    keyboard/footer를 명시하지 않으면 신규 등록(소재등록)용 기본값 사용.
+    /복구의 보류 카드는 keyboard/footer를 override해서 호출."""
     media_items = _normalize_media(media_items)
     media_count = len(media_items)
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
-                {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
+    if keyboard is None:
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
+                    {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
+                ]
             ]
-        ]
-    }
-    footer = "⚡ 즉시 인스타 업로드 후 버튼 눌러주세요👇" if urgent else "인스타에 올린 후 아래 버튼 눌러주세요👇"
+        }
+    if footer is None:
+        footer = "⚡ 즉시 인스타 업로드 후 버튼 눌러주세요👇" if urgent else "인스타에 올린 후 아래 버튼 눌러주세요👇"
 
     # 긴급일 경우 캡션 안에 멘션 임베드
     parse_mode = None
