@@ -223,40 +223,58 @@ def get_telegram_file_url(file_id):
 
 
 def get_media_from_message(message):
-    """메시지에서 사진/영상 URL을 추출. [(type, url), ...] 반환."""
+    """메시지에서 사진/영상을 추출. [(type, url, file_id), ...] 반환.
+
+    url은 getFile 가능(<=20MB)할 때만 채워지고, 초과 시 None.
+    file_id는 항상 보존되어 텔레그램 재전송에 사용 가능."""
     items = []
     photos = message.get("photo", [])
     if photos:
         largest = max(photos, key=lambda p: p.get("file_size", 0))
-        url = get_telegram_file_url(largest["file_id"])
-        if url:
-            items.append(("photo", url))
+        file_id = largest["file_id"]
+        url = get_telegram_file_url(file_id)
+        items.append(("photo", url, file_id))
     video = message.get("video")
     if video:
-        url = get_telegram_file_url(video["file_id"])
-        if url:
-            items.append(("video", url))
+        file_id = video["file_id"]
+        url = get_telegram_file_url(file_id)
+        items.append(("video", url, file_id))
     return items
 
 
 def _normalize_media(media):
-    """media가 [(type, url), ...] 또는 URL 문자열/리스트도 받게 정규화."""
+    """media를 [(type, url, file_id), ...] 형태로 정규화.
+
+    하위 호환:
+    - URL 문자열 → ("photo", url, None)
+    - 2-튜플 (type, url) → (type, url, None)
+    - 3-튜플 (type, url, file_id) → 그대로
+    """
     if isinstance(media, str):
-        return [("photo", media)]
+        return [("photo", media, None)]
     if isinstance(media, list):
         normalized = []
         for item in media:
             if isinstance(item, str):
-                normalized.append(("photo", item))
-            elif isinstance(item, tuple) and len(item) == 2:
-                normalized.append(item)
+                normalized.append(("photo", item, None))
+            elif isinstance(item, tuple):
+                if len(item) == 3:
+                    normalized.append(item)
+                elif len(item) == 2:
+                    normalized.append((item[0], item[1], None))
         return normalized
     return []
 
 
 def save_to_notion(title, link, media, note="", urgent=False):
-    """media: [(type, url), ...]. type은 'photo' 또는 'video'."""
+    """media: [(type, url, file_id), ...]. type은 'photo' 또는 'video'."""
     media_items = _normalize_media(media)
+    notion_media = [(t, u) for t, u, _ in media_items if u]
+    skipped = sum(1 for _, u, _ in media_items if not u)
+
+    if skipped:
+        warn = f"⚠️ 영상 {skipped}개는 20MB 초과로 Notion에 첨부되지 않았습니다 (텔레그램 카드에는 정상 표시)"
+        note = f"{note}\n{warn}" if note else warn
 
     properties = {
         "날짜": {"title": [{"text": {"content": title}}]},
@@ -265,9 +283,9 @@ def save_to_notion(title, link, media, note="", urgent=False):
     }
     if link:
         properties["참고 링크"] = {"url": link}
-    if media_items:
+    if notion_media:
         files = []
-        for i, (mtype, url) in enumerate(media_items):
+        for i, (mtype, url) in enumerate(notion_media):
             ext = "mp4" if mtype == "video" else "jpg"
             prefix = "telegram_video" if mtype == "video" else "telegram_photo"
             files.append(
@@ -283,7 +301,7 @@ def save_to_notion(title, link, media, note="", urgent=False):
 
     # 페이지 본문에 이미지/영상 블록 추가
     children = []
-    for mtype, url in media_items:
+    for mtype, url in notion_media:
         block_type = "video" if mtype == "video" else "image"
         children.append(
             {
@@ -343,10 +361,12 @@ def fetch_notion_page(page_id):
 def update_notion_page_photos(page_id, media, new_link=None, new_note=None, has_new_text=False):
     """기존 페이지의 사진/영상 교체 + 본문 미디어 블록 재구성."""
     media_items = _normalize_media(media)
+    notion_media = [(t, u) for t, u, _ in media_items if u]
+    skipped = sum(1 for _, u, _ in media_items if not u)
     properties = {}
-    if media_items:
+    if notion_media:
         files = []
-        for i, (mtype, url) in enumerate(media_items):
+        for i, (mtype, url) in enumerate(notion_media):
             ext = "mp4" if mtype == "video" else "jpg"
             prefix = "telegram_video" if mtype == "video" else "telegram_photo"
             files.append(
@@ -359,8 +379,16 @@ def update_notion_page_photos(page_id, media, new_link=None, new_note=None, has_
         properties["사진"] = {"files": files}
     if has_new_text:
         properties["참고 링크"] = {"url": new_link} if new_link else {"url": None}
+        warn = (
+            f"⚠️ 영상 {skipped}개는 20MB 초과로 Notion에 첨부되지 않았습니다 (텔레그램 카드에는 정상 표시)"
+            if skipped
+            else ""
+        )
+        merged_note = f"{new_note}\n{warn}".strip() if (new_note and warn) else (new_note or warn)
         properties["비고"] = (
-            {"rich_text": [{"text": {"content": new_note}}]} if new_note else {"rich_text": []}
+            {"rich_text": [{"text": {"content": merged_note}}]}
+            if merged_note
+            else {"rich_text": []}
         )
 
     if properties:
@@ -383,9 +411,9 @@ def update_notion_page_photos(page_id, media, new_link=None, new_note=None, has_
                     f"{NOTION_API}/blocks/{block['id']}", headers=NOTION_HEADERS
                 )
 
-    if media_items:
+    if notion_media:
         children = []
-        for mtype, url in media_items:
+        for mtype, url in notion_media:
             block_type = "video" if mtype == "video" else "image"
             children.append(
                 {
@@ -555,11 +583,11 @@ def extract_item_data(item):
         else:
             url = None
         if url:
-            media_items.append((mtype, url))
+            media_items.append((mtype, url, None))
 
     # /대기 호환용: 첫 번째 미디어만 사용
     if media_items:
-        media_type, media_url = media_items[0]
+        media_type, media_url = media_items[0][0], media_items[0][1]
     else:
         media_type, media_url = "photo", None
 
@@ -575,10 +603,17 @@ def extract_item_data(item):
     }
 
 
-def send_photo(chat_id, photo_url, caption, reply_markup=None, parse_mode=None):
-    """텔레그램 URL인 경우 다운로드 후 재업로드."""
+def send_photo(chat_id, photo_url, caption, reply_markup=None, parse_mode=None, file_id=None):
+    """file_id가 있으면 그대로 재전송. 없으면 텔레그램 URL은 다운로드 후 재업로드."""
     try:
-        if photo_url.startswith("https://api.telegram.org/file/"):
+        if file_id:
+            payload = {"chat_id": chat_id, "photo": file_id, "caption": caption}
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            res = requests.post(f"{TELEGRAM_API}/sendPhoto", json=payload, timeout=60)
+        elif photo_url and photo_url.startswith("https://api.telegram.org/file/"):
             img = requests.get(photo_url, timeout=30)
             if img.status_code != 200:
                 return None
@@ -589,23 +624,33 @@ def send_photo(chat_id, photo_url, caption, reply_markup=None, parse_mode=None):
             if parse_mode:
                 data["parse_mode"] = parse_mode
             res = requests.post(f"{TELEGRAM_API}/sendPhoto", files=files, data=data, timeout=60)
-        else:
+        elif photo_url:
             payload = {"chat_id": chat_id, "photo": photo_url, "caption": caption}
             if reply_markup:
                 payload["reply_markup"] = reply_markup
             if parse_mode:
                 payload["parse_mode"] = parse_mode
             res = requests.post(f"{TELEGRAM_API}/sendPhoto", json=payload, timeout=60)
+        else:
+            return None
         return res.json().get("result", {}).get("message_id")
     except Exception as e:
         print(f"send_photo error: {e}")
         return None
 
 
-def send_video(chat_id, video_url, caption, reply_markup=None, parse_mode=None):
-    """영상 전송 (텔레그램 URL은 다운로드 후 재업로드)."""
+def send_video(chat_id, video_url, caption, reply_markup=None, parse_mode=None, file_id=None):
+    """file_id가 있으면 그대로 재전송(사이즈 제한 없음).
+    없으면 텔레그램 URL은 다운로드 후 재업로드."""
     try:
-        if video_url.startswith("https://api.telegram.org/file/"):
+        if file_id:
+            payload = {"chat_id": chat_id, "video": file_id, "caption": caption}
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            res = requests.post(f"{TELEGRAM_API}/sendVideo", json=payload, timeout=120)
+        elif video_url and video_url.startswith("https://api.telegram.org/file/"):
             vid = requests.get(video_url, timeout=120)
             if vid.status_code != 200:
                 return None
@@ -616,13 +661,15 @@ def send_video(chat_id, video_url, caption, reply_markup=None, parse_mode=None):
             if parse_mode:
                 data["parse_mode"] = parse_mode
             res = requests.post(f"{TELEGRAM_API}/sendVideo", files=files, data=data, timeout=300)
-        else:
+        elif video_url:
             payload = {"chat_id": chat_id, "video": video_url, "caption": caption}
             if reply_markup:
                 payload["reply_markup"] = reply_markup
             if parse_mode:
                 payload["parse_mode"] = parse_mode
             res = requests.post(f"{TELEGRAM_API}/sendVideo", json=payload, timeout=300)
+        else:
+            return None
         return res.json().get("result", {}).get("message_id")
     except Exception as e:
         print(f"send_video error: {e}")
@@ -630,20 +677,30 @@ def send_video(chat_id, video_url, caption, reply_markup=None, parse_mode=None):
 
 
 def send_media_group(chat_id, media_items, caption, parse_mode=None):
-    """여러 사진/영상을 album으로 전송. 첫 항목에만 캡션. 첫 메시지 ID 반환."""
+    """여러 사진/영상을 album으로 전송. 첫 항목에만 캡션. 첫 메시지 ID 반환.
+
+    file_id가 있으면 다운로드 없이 그대로 재전송(20MB 초과 영상도 OK).
+    file_id가 없으면 URL을 다운로드해서 multipart 업로드."""
+    media_items = _normalize_media(media_items)
     try:
         files = {}
         media = []
-        for i, (mtype, url) in enumerate(media_items[:10]):  # Telegram media group 최대 10개
-            data_res = requests.get(url, timeout=120)
-            if data_res.status_code != 200:
+        for i, (mtype, url, file_id) in enumerate(media_items[:10]):
+            if file_id:
+                # 텔레그램 → 텔레그램: file_id 직접 사용 (사이즈 제한 없음)
+                item = {"type": mtype, "media": file_id}
+            elif url:
+                data_res = requests.get(url, timeout=120)
+                if data_res.status_code != 200:
+                    continue
+                attach_name = f"m{i}"
+                ext = "mp4" if mtype == "video" else "jpg"
+                mime = "video/mp4" if mtype == "video" else "image/jpeg"
+                files[attach_name] = (f"m{i}.{ext}", data_res.content, mime)
+                item = {"type": mtype, "media": f"attach://{attach_name}"}
+            else:
                 continue
-            attach_name = f"m{i}"
-            ext = "mp4" if mtype == "video" else "jpg"
-            mime = "video/mp4" if mtype == "video" else "image/jpeg"
-            files[attach_name] = (f"m{i}.{ext}", data_res.content, mime)
-            item = {"type": mtype, "media": f"attach://{attach_name}"}
-            if i == 0:
+            if not media:  # 첫 유효 항목에만 캡션
                 item["caption"] = caption
                 if parse_mode:
                     item["parse_mode"] = parse_mode
@@ -651,7 +708,10 @@ def send_media_group(chat_id, media_items, caption, parse_mode=None):
         if not media:
             return None
         data = {"chat_id": str(chat_id), "media": json.dumps(media)}
-        res = requests.post(f"{TELEGRAM_API}/sendMediaGroup", files=files, data=data, timeout=300)
+        if files:
+            res = requests.post(f"{TELEGRAM_API}/sendMediaGroup", files=files, data=data, timeout=300)
+        else:
+            res = requests.post(f"{TELEGRAM_API}/sendMediaGroup", data=data, timeout=120)
         result = res.json().get("result", [])
         return result[0]["message_id"] if result else None
     except Exception as e:
@@ -1194,12 +1254,12 @@ def send_card(chat_id, media_items, caption_body, page_id, reply_to_message_id=N
         if button_id:
             sent_ids.append(button_id)
     elif media_count == 1:
-        mtype, url = media_items[0]
+        mtype, url, file_id = media_items[0]
         full_caption = caption_body + "\n\n" + footer
         if mtype == "video":
-            sid = send_video(chat_id, url, full_caption, keyboard, parse_mode=parse_mode)
+            sid = send_video(chat_id, url, full_caption, keyboard, parse_mode=parse_mode, file_id=file_id)
         else:
-            sid = send_photo(chat_id, url, full_caption, keyboard, parse_mode=parse_mode)
+            sid = send_photo(chat_id, url, full_caption, keyboard, parse_mode=parse_mode, file_id=file_id)
         if sid:
             sent_ids.append(sid)
     else:
