@@ -656,8 +656,17 @@ def send_media_group(chat_id, media_items, caption, parse_mode=None):
         return None
 
 
+def schedule_ephemeral_deletion(chat_id, message_id, delay=30):
+    """일회성 메시지(예: /개수 응답)를 delay 초 후 자동 삭제."""
+    if not message_id:
+        return
+    t = threading.Timer(delay, delete_message, args=[chat_id, message_id])
+    t.daemon = True
+    t.start()
+
+
 def send_status_summary(chat_id):
-    """재고 관점 압축형 카운트 표시."""
+    """재고 관점 압축형 카운트 표시. 30초 후 자동 삭제 (휘발성)."""
     s = get_status_summary()
     stock = s["normal_pending"] + s["hold"]
     lines = []
@@ -665,7 +674,8 @@ def send_status_summary(chat_id):
         lines.append(f"🚨 긴급 미완료: {s['urgent_pending']}건")
     lines.append(f"📦 재고 {stock}건 (대기 {s['normal_pending']} · 보류 {s['hold']})")
     lines.append(f"📤 오늘 {s['completed_today']}건 · 이번 달 {s['completed_month']}건")
-    send_message(chat_id, "\n".join(lines))
+    msg_id = send_message(chat_id, "\n".join(lines))
+    schedule_ephemeral_deletion(chat_id, msg_id, delay=30)
 
 
 def cache_invalidate_media(page_id):
