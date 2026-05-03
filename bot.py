@@ -638,7 +638,7 @@ def cache_invalidate_media(page_id):
 
 
 def send_pending_media_cached(chat_id, page_id, media_type, media_url, caption, keyboard):
-    """/대기 카드 미디어 전송 — file_id 캐시 사용. 반환: message_id."""
+    """/대기·/복구 카드 미디어 전송 — file_id 캐시 사용. 반환: message_id."""
     cached = media_cache.get(page_id)
     if cached and cached[0] == media_type:
         endpoint = "sendVideo" if media_type == "video" else "sendPhoto"
@@ -658,22 +658,38 @@ def send_pending_media_cached(chat_id, page_id, media_type, media_url, caption, 
         except Exception as e:
             print(f"send_pending_media_cached cache hit error: {e}")
 
-    # 캐시 미스 또는 무효 → URL로 전송 + file_id 저장
-    if media_type == "video":
-        endpoint = "sendVideo"
-        url_field = "video"
-    else:
-        endpoint = "sendPhoto"
-        url_field = "photo"
+    # 캐시 미스 또는 무효 — Telegram CDN URL은 자기 자신이 못 받으므로
+    # 다운로드 후 multipart 업로드로 재전송. 외부 URL은 직접 전송.
+    endpoint = "sendVideo" if media_type == "video" else "sendPhoto"
+    field = "video" if media_type == "video" else "photo"
 
     try:
-        payload = {
-            "chat_id": chat_id,
-            url_field: media_url,
-            "caption": caption,
-            "reply_markup": keyboard,
-        }
-        res = requests.post(f"{TELEGRAM_API}/{endpoint}", json=payload, timeout=120)
+        if media_url.startswith("https://api.telegram.org/file/"):
+            timeout_dl = 120 if media_type == "video" else 30
+            timeout_up = 300 if media_type == "video" else 60
+            dl_res = requests.get(media_url, timeout=timeout_dl)
+            if dl_res.status_code != 200:
+                return None
+            ext = "mp4" if media_type == "video" else "jpg"
+            mime = "video/mp4" if media_type == "video" else "image/jpeg"
+            files = {field: (f"file.{ext}", dl_res.content, mime)}
+            data = {
+                "chat_id": str(chat_id),
+                "caption": caption,
+                "reply_markup": json.dumps(keyboard),
+            }
+            res = requests.post(
+                f"{TELEGRAM_API}/{endpoint}", files=files, data=data, timeout=timeout_up
+            )
+        else:
+            payload = {
+                "chat_id": chat_id,
+                field: media_url,
+                "caption": caption,
+                "reply_markup": keyboard,
+            }
+            res = requests.post(f"{TELEGRAM_API}/{endpoint}", json=payload, timeout=120)
+
         result = res.json().get("result", {})
         message_id = result.get("message_id")
         if media_type == "video":
@@ -685,7 +701,7 @@ def send_pending_media_cached(chat_id, page_id, media_type, media_url, caption, 
             media_cache[page_id] = (media_type, file_id)
         return message_id
     except Exception as e:
-        print(f"send_pending_media_cached URL send error: {e}")
+        print(f"send_pending_media_cached send error: {e}")
         return None
 
 
