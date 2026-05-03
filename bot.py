@@ -802,13 +802,16 @@ def search_notion(keyword):
 def send_search_results(chat_id, keyword, max_items=10):
     results = search_notion(keyword)
     if results is None:
-        send_message(chat_id, "❌ 검색 실패")
+        mid = send_message(chat_id, "❌ 검색 실패")
+        schedule_ephemeral_deletion(chat_id, mid, delay=30)
         return
     if not results:
-        send_message(chat_id, f"🔍 '{keyword}' — 결과 없음")
+        mid = send_message(chat_id, f"🔍 '{keyword}' — 결과 없음")
+        schedule_ephemeral_deletion(chat_id, mid, delay=30)
         return
 
-    send_message(chat_id, f"🔍 '{keyword}' — {len(results)}건")
+    sent_ids = []
+    sent_ids.append(send_message(chat_id, f"🔍 '{keyword}' — {len(results)}건"))
 
     status_emoji = {"소재등록": "📋", "업로드완료": "✅", "보류": "🚫"}
 
@@ -830,14 +833,20 @@ def send_search_results(chat_id, keyword, max_items=10):
 
         if data["media_url"]:
             if data["media_type"] == "video":
-                send_video(chat_id, data["media_url"], caption)
+                sent_ids.append(send_video(chat_id, data["media_url"], caption))
             else:
-                send_photo(chat_id, data["media_url"], caption)
+                sent_ids.append(send_photo(chat_id, data["media_url"], caption))
         else:
-            send_message(chat_id, caption)
+            sent_ids.append(send_message(chat_id, caption))
 
     if len(results) > max_items:
-        send_message(chat_id, f"...외 {len(results) - max_items}건 (Notion에서 확인)")
+        sent_ids.append(
+            send_message(chat_id, f"...외 {len(results) - max_items}건 (Notion에서 확인)")
+        )
+
+    # 검색 결과는 3분 후 자동 삭제 (사진/링크 확인할 시간 충분)
+    for mid in sent_ids:
+        schedule_ephemeral_deletion(chat_id, mid, delay=180)
 
 
 def upgrade_to_urgent(chat_id, page_id, bot_card_message_id):
@@ -1408,7 +1417,9 @@ def handle_message(message):
                 "🧹 완료 카드는 1시간 후 또는 /대기 시 자동 정리 (보류는 계속 보관)\n"
                 "🗑 보류 카드의 폐기 버튼으로 Notion에서도 영구 삭제"
             )
-            send_message(chat_id, help_text)
+            help_msg_id = send_message(chat_id, help_text)
+            # 도움말은 1분 후 자동 삭제 (읽을 시간 충분)
+            schedule_ephemeral_deletion(chat_id, help_msg_id, delay=60)
             return
 
     if not has_media and not text:
