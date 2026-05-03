@@ -55,9 +55,12 @@ hold_cards = {}
 
 def register_card(chat_id, page_id, message_ids):
     pending_cards.setdefault(chat_id, {})[page_id] = list(message_ids)
+    notion_mark_visible(page_id, True)
 
 
 def unregister_card(chat_id, page_id):
+    # 카드 상태 전이용 (보류/완료로 갈 때) — 메시지는 채팅에 그대로 있음
+    # → Notion 표시중은 건드리지 않음
     if chat_id in pending_cards:
         pending_cards[chat_id].pop(page_id, None)
 
@@ -73,6 +76,8 @@ def delete_and_unregister_card(chat_id, page_id):
     unregister_card(chat_id, page_id)
     # 보류 추적도 함께 정리 (/수정으로 보류 카드 교체 시 스테일 방지)
     unregister_hold_card(chat_id, page_id)
+    # 잠시 안 보임 표시 (직후 새 카드 register 시 다시 True로 돌아감)
+    notion_mark_visible(page_id, False)
 
 
 def get_all_pending_message_ids(chat_id):
@@ -83,9 +88,12 @@ def get_all_pending_message_ids(chat_id):
 
 
 def clear_all_pending_cards(chat_id):
+    page_ids_to_clear = list(pending_cards.get(chat_id, {}).keys())
     for mid in get_all_pending_message_ids(chat_id):
         delete_message(chat_id, mid)
     pending_cards[chat_id] = {}
+    for pid in page_ids_to_clear:
+        notion_mark_visible(pid, False)
 
 
 def _delete_completed_card_now(chat_id, page_id):
@@ -93,6 +101,7 @@ def _delete_completed_card_now(chat_id, page_id):
         entry = completed_cards.get(chat_id, {}).pop(page_id, None)
     if entry:
         delete_message(chat_id, entry["message_id"])
+        notion_mark_visible(page_id, False)
 
 
 def schedule_completed_deletion(chat_id, page_id, message_id, delay=COMPLETED_AUTO_DELETE_DELAY):
@@ -122,21 +131,25 @@ def clear_all_completed_cards(chat_id):
     """/대기 호출 시 완료 카드 일괄 삭제 + 타이머 정리 (보류는 추적 안 됨)."""
     with completed_cards_lock:
         cards = completed_cards.get(chat_id, {})
+        page_ids_to_clear = list(cards.keys())
         snapshot = list(cards.values())
         for entry in snapshot:
             entry["timer"].cancel()
         completed_cards[chat_id] = {}
     for entry in snapshot:
         delete_message(chat_id, entry["message_id"])
+    for pid in page_ids_to_clear:
+        notion_mark_visible(pid, False)
 
 
 def register_hold_card(chat_id, page_id, message_ids):
     """🚫 보류 시 추적 — /복구가 중복 등록하지 않도록."""
     hold_cards.setdefault(chat_id, {})[page_id] = list(message_ids)
+    notion_mark_visible(page_id, True)
 
 
 def unregister_hold_card(chat_id, page_id):
-    """↩ 되돌리기 / 🗑 폐기 시 보류 추적 해제."""
+    """상태 전이용 — 메시지는 채팅에 그대로 있음 → Notion은 건드리지 않음."""
     if chat_id in hold_cards:
         hold_cards[chat_id].pop(page_id, None)
 
@@ -301,6 +314,20 @@ def archive_notion_page(page_id):
         json={"archived": True},
     )
     return res.status_code == 200
+
+
+def notion_mark_visible(page_id, visible):
+    """텔레그램에 표시 중인지 Notion '표시중' 체크박스에 기록.
+    봇 재시작 후에도 /복구가 중복 등록하지 않도록 영속 추적."""
+    try:
+        requests.patch(
+            f"{NOTION_API}/pages/{page_id}",
+            headers=NOTION_HEADERS,
+            json={"properties": {"표시중": {"checkbox": bool(visible)}}},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"notion_mark_visible error: {e}")
 
 
 def fetch_notion_page(page_id):
@@ -821,13 +848,15 @@ def upgrade_to_urgent(chat_id, page_id, bot_card_message_id):
 
 
 def send_full_recovery(chat_id, max_items_per_kind=30):
-    """전체 복구: 소재등록 + 보류 카드를 Notion에서 다시 채팅에 등록.
-    이미 채팅에 표시 중인 카드는 스킵 (중복 방지).
-    채팅방 메시지 삭제/재입장 후 사용 권장."""
+    """전체 복구: 소재등록 + 보류 카드 중 채팅에서 사라진 것만 다시 등록.
+
+    Notion '표시중' 체크박스를 영속 추적 신호로 사용 → 봇 재시작에도 안전."""
     body = {
         "filter": {
-            "property": "상태",
-            "select": {"does_not_equal": "업로드완료"},
+            "and": [
+                {"property": "상태", "select": {"does_not_equal": "업로드완료"}},
+                {"property": "표시중", "checkbox": {"equals": False}},
+            ]
         },
         "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
     }
@@ -842,19 +871,16 @@ def send_full_recovery(chat_id, max_items_per_kind=30):
     items = res.json().get("results", [])
 
     if not items:
-        send_message(chat_id, "🎉 복구할 카드가 없습니다. (전부 업로드 완료 상태)")
+        send_message(chat_id, "🎉 복구할 카드가 없습니다. (모두 표시 중이거나 완료됨)")
         return
 
-    # 이미 채팅에 표시 중인 카드는 스킵
+    # 메모리 추적과도 비교 (방금 만든 카드는 표시중 업데이트 전일 수 있음)
     already_visible = get_visible_page_ids(chat_id)
     new_items = [i for i in items if i["id"] not in already_visible]
     skipped = len(items) - len(new_items)
 
     if not new_items:
-        send_message(
-            chat_id,
-            f"🎉 모든 카드가 이미 표시 중입니다 ({skipped}건 스킵)",
-        )
+        send_message(chat_id, f"🎉 복구할 새 카드가 없습니다 ({skipped}건 메모리 스킵)")
         return
 
     pending_items = []
@@ -941,6 +967,40 @@ def send_full_recovery(chat_id, max_items_per_kind=30):
         truncated.append(f"보류 {len(hold_items) - max_items_per_kind}건")
     if truncated:
         send_message(chat_id, f"...외 {' · '.join(truncated)} 더 있음 (Notion에서 확인)")
+
+
+def sync_visible_marker(chat_id):
+    """일회용 마이그레이션: 모든 비-완료 카드를 '표시중'으로 마크.
+    이미 채팅에 카드들이 떠 있는 상태에서, /복구가 중복으로 다시 보내지 않도록
+    Notion '표시중' 체크박스를 일괄 True로 설정."""
+    body = {
+        "filter": {
+            "and": [
+                {"property": "상태", "select": {"does_not_equal": "업로드완료"}},
+                {"property": "표시중", "checkbox": {"equals": False}},
+            ]
+        },
+        "page_size": 100,
+    }
+    total = 0
+    while True:
+        res = requests.post(
+            f"{NOTION_API}/databases/{DATABASE_ID}/query",
+            headers=NOTION_HEADERS,
+            json=body,
+        )
+        if res.status_code != 200:
+            send_message(chat_id, "❌ Notion 조회 실패")
+            return
+        data = res.json()
+        items = data.get("results", [])
+        for item in items:
+            notion_mark_visible(item["id"], True)
+            total += 1
+        if not data.get("has_more"):
+            break
+        body["start_cursor"] = data["next_cursor"]
+    send_message(chat_id, f"🔁 동기화 완료: 비-완료 카드 {total}건을 '표시중'으로 마크")
 
 
 def send_pending_list(chat_id, max_items=15):
@@ -1289,6 +1349,10 @@ def handle_message(message):
             delete_message(chat_id, message_id)
             send_full_recovery(chat_id)
             return
+        if cmd in ("/동기화", "/sync"):
+            delete_message(chat_id, message_id)
+            sync_visible_marker(chat_id)
+            return
         if cmd in ("/개수", "/카운트", "/count", "/현황"):
             delete_message(chat_id, message_id)
             send_status_summary(chat_id)
@@ -1324,7 +1388,8 @@ def handle_message(message):
                 "/개수 - 재고 + 발행 카운트\n"
                 "/검색 키워드 - 비고/링크 검색\n"
                 "/긴급 - (카드에 답장) 긴급으로 승격\n"
-                "/복구 - 채팅 비운 후 소재등록+보류 재등록\n"
+                "/복구 - 채팅에서 사라진 소재등록+보류만 다시 등록\n"
+                "/동기화 - 일회용: 채팅에 떠 있는 모든 카드를 '표시중'으로 마크\n"
                 "/도움말 - 이 메시지\n\n"
                 "📤 사진/영상 + 캡션을 보내면 자동 저장\n"
                 "✏️ 봇 카드에 새 사진 답장하면 사진 교체\n"
