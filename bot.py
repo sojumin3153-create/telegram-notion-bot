@@ -335,6 +335,23 @@ def update_notion_status(page_id, status):
     return res.status_code == 200
 
 
+def update_notion_script(page_id, script_text):
+    """노션 페이지의 '대본' 속성에 텍스트 저장. 2000자씩 나눠서 rich_text 배열로 전달."""
+    chunks = [script_text[i:i + 2000] for i in range(0, len(script_text), 2000)] or [""]
+    rich_text = [{"text": {"content": c}} for c in chunks]
+    try:
+        res = requests.patch(
+            f"{NOTION_API}/pages/{page_id}",
+            headers=NOTION_HEADERS,
+            json={"properties": {"대본": {"rich_text": rich_text}}},
+            timeout=15,
+        )
+        return res.status_code == 200
+    except Exception as e:
+        print(f"update_notion_script error: {e}")
+        return False
+
+
 def archive_notion_page(page_id):
     """페이지를 Notion에서 아카이브(휴지통 이동) — 사실상 삭제."""
     res = requests.patch(
@@ -1429,6 +1446,8 @@ def handle_script_submission(chat_id, reply_message_id, prompt_message_id, page_
     if not page:
         send_message(chat_id, "❌ 카드를 찾을 수 없어 대본을 발행하지 못했습니다.")
         return
+
+    update_notion_script(page_id, script_text)
 
     data = extract_item_data(page)
     media_items = data["media_items"]
