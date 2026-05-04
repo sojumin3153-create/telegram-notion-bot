@@ -1472,7 +1472,7 @@ def handle_script_submission(chat_id, reply_message_id, prompt_message_id, page_
         if mid:
             new_message_ids.append(mid)
 
-    label_keyboard = {
+    script_keyboard = {
         "inline_keyboard": [
             [
                 {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
@@ -1480,16 +1480,13 @@ def handle_script_submission(chat_id, reply_message_id, prompt_message_id, page_
             ]
         ]
     }
-    label_id = send_message(
-        chat_id,
-        "📋 대본 ↓ (길게 눌러 복사)",
-        reply_markup=label_keyboard,
-    )
-    if label_id:
-        new_message_ids.append(label_id)
-
     safe_script = html_escape(script_text)
-    script_id = send_message(chat_id, f"<pre>{safe_script}</pre>", parse_mode="HTML")
+    script_id = send_message(
+        chat_id,
+        f"<pre>{safe_script}</pre>",
+        reply_markup=script_keyboard,
+        parse_mode="HTML",
+    )
     if script_id:
         new_message_ids.append(script_id)
 
