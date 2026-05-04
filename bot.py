@@ -1124,17 +1124,7 @@ def send_pending_list(chat_id, max_items=15):
             caption_parts.append(f"🔗 {data['link']}")
         caption = "\n".join(caption_parts)
 
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "✅ 업로드 완료", "callback_data": f"complete:{data['page_id']}"},
-                    {"text": "🚫 보류", "callback_data": f"hold:{data['page_id']}"},
-                ],
-                [
-                    {"text": "📝 대본 전달", "web_app": {"url": f"{WEB_APP_URL}?page_id={data['page_id']}"}},
-                ],
-            ]
-        }
+        keyboard = build_card_keyboard(data["page_id"])
 
         if data["media_url"]:
             mid = send_pending_media_cached(
@@ -1196,18 +1186,7 @@ def delete_message(chat_id, message_id):
 
 
 def send_complete_button_reply(chat_id, text, reply_to_message_id, page_id):
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
-                {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
-            ],
-            [
-                {"text": "📝 대본 전달", "web_app": {"url": f"{WEB_APP_URL}?page_id={page_id}"}},
-            ],
-        ]
-    }
-    return send_message(chat_id, text, reply_to_message_id, keyboard)
+    return send_message(chat_id, text, reply_to_message_id, build_card_keyboard(page_id))
 
 
 def build_card_caption(title, media_count, note, link, has_video=False, urgent=False):
@@ -1235,17 +1214,7 @@ def send_card(chat_id, media_items, caption_body, page_id, reply_to_message_id=N
     media_items = _normalize_media(media_items)
     media_count = len(media_items)
     if keyboard is None:
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
-                    {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
-                ],
-                [
-                    {"text": "📝 대본 전달", "web_app": {"url": f"{WEB_APP_URL}?page_id={page_id}"}},
-                ],
-            ]
-        }
+        keyboard = build_card_keyboard(page_id)
     if footer is None:
         footer = "⚡ 즉시 인스타 업로드 후 버튼 눌러주세요👇" if urgent else "인스타에 올린 후 아래 버튼 눌러주세요👇"
 
@@ -1420,6 +1389,21 @@ def buffer_media_group(media_group_id, message):
         timer.daemon = True
         timer.start()
         entry["timer"] = timer
+
+
+def build_card_keyboard(page_id):
+    """카드 인라인 키보드. WEB_APP_URL이 없으면 📝 대본 전달 버튼은 생략."""
+    rows = [
+        [
+            {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
+            {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
+        ]
+    ]
+    if WEB_APP_URL:
+        rows.append([
+            {"text": "📝 대본 전달", "web_app": {"url": f"{WEB_APP_URL}?page_id={page_id}"}},
+        ])
+    return {"inline_keyboard": rows}
 
 
 def update_notion_script(page_id, script_text):
@@ -1711,17 +1695,7 @@ def handle_callback_query(callback):
                 "",
                 current_text,
             ).rstrip()
-            keyboard = {
-                "inline_keyboard": [
-                    [
-                        {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
-                        {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
-                    ],
-                    [
-                        {"text": "📝 대본 전달", "web_app": {"url": f"{WEB_APP_URL}?page_id={page_id}"}},
-                    ],
-                ]
-            }
+            keyboard = build_card_keyboard(page_id)
             edit_message(chat_id, message_id, new_text, has_caption, keyboard)
             # 되돌리기로 재고가 회복되었을 수 있으므로 트래커 갱신
             check_low_stock_alert(chat_id)
