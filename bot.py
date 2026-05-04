@@ -1739,24 +1739,7 @@ def handle_callback_query(callback):
             pending_script_prompts.setdefault(chat_id, {})[prompt_id] = page_id
 
     elif data.startswith("discard:"):
-        # 1단계: 폐기 확인 다이얼로그 (버튼만 교체)
-        page_id = data.split(":", 1)[1]
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "⚠️ 정말 폐기", "callback_data": f"confirm_discard:{page_id}"},
-                    {"text": "↩ 취소", "callback_data": f"cancel_discard:{page_id}"},
-                ]
-            ]
-        }
-        edit_message(chat_id, message_id, current_text, has_caption, keyboard)
-        requests.post(
-            f"{TELEGRAM_API}/answerCallbackQuery",
-            json={"callback_query_id": query_id, "text": "정말 폐기하시겠습니까?"},
-        )
-
-    elif data.startswith("confirm_discard:"):
-        # 2단계: 실제 폐기 실행
+        # 폐기: 확인 단계 없이 바로 Notion 보관 + 텔레그램 카드 삭제
         page_id = data.split(":", 1)[1]
         success = archive_notion_page(page_id)
         if success:
@@ -1764,7 +1747,6 @@ def handle_callback_query(callback):
                 f"{TELEGRAM_API}/answerCallbackQuery",
                 json={"callback_query_id": query_id, "text": "🗑 폐기 완료"},
             )
-            # 텔레그램 카드 삭제 + 추적/캐시 정리
             delete_message(chat_id, message_id)
             unregister_card(chat_id, page_id)
             unregister_hold_card(chat_id, page_id)
@@ -1779,23 +1761,6 @@ def handle_callback_query(callback):
                     "show_alert": True,
                 },
             )
-
-    elif data.startswith("cancel_discard:"):
-        # 폐기 취소 → 보류 상태 버튼으로 복귀
-        page_id = data.split(":", 1)[1]
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "↩ 되돌리기", "callback_data": f"undo:{page_id}"},
-                    {"text": "🗑 폐기", "callback_data": f"discard:{page_id}"},
-                ]
-            ]
-        }
-        edit_message(chat_id, message_id, current_text, has_caption, keyboard)
-        requests.post(
-            f"{TELEGRAM_API}/answerCallbackQuery",
-            json={"callback_query_id": query_id, "text": "취소됨"},
-        )
 
 
 def send_daily_summary():
