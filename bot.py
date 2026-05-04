@@ -5,6 +5,7 @@ import json
 import threading
 import requests
 from datetime import datetime, timedelta, timezone
+from html import escape as html_escape
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -41,6 +42,7 @@ media_cache = {}
 # 재고 부족 알림: 재고(대기+보류) ≤ 임계값으로 떨어지면 그룹에 알림
 LOW_STOCK_THRESHOLD = 5
 last_stock_count = None  # 첫 관측 시 초기화
+low_stock_alert_messages = {}  # {chat_id: message_id} — 재고 회복 시 삭제용
 
 # 완료 카드 자동 삭제 추적: {chat_id: {page_id: {"message_id": int, "timer": Timer}}}
 # 보류는 계속 보관 (재작업용), 완료만 1시간 후 자동 삭제 (/대기 시 즉시 정리, ↩ 시 취소)
@@ -54,6 +56,10 @@ hold_cards = {}
 
 # 매일 9시 알림: 직전 알림 메시지 ID 추적 (다음날 알림 도착 시 자동 삭제)
 last_daily_notification_msg_id = None
+
+# 대본 입력 대기: {chat_id: {prompt_message_id: page_id}}
+# 📝 대본 전달 버튼 누르면 Force Reply 프롬프트 발행, 답장 도착 시 page_id 매칭에 사용
+pending_script_prompts = {}
 
 
 def register_card(chat_id, page_id, message_ids):
@@ -103,12 +109,13 @@ def _delete_completed_card_now(chat_id, page_id):
     with completed_cards_lock:
         entry = completed_cards.get(chat_id, {}).pop(page_id, None)
     if entry:
-        delete_message(chat_id, entry["message_id"])
+        for mid in entry["message_ids"]:
+            delete_message(chat_id, mid)
         notion_mark_visible(page_id, False)
 
 
-def schedule_completed_deletion(chat_id, page_id, message_id, delay=COMPLETED_AUTO_DELETE_DELAY):
-    """완료 카드를 N초 뒤 자동 삭제 예약."""
+def schedule_completed_deletion(chat_id, page_id, message_ids, delay=COMPLETED_AUTO_DELETE_DELAY):
+    """완료 카드(앨범+버튼 등 관련 메시지 전부)를 N초 뒤 자동 삭제 예약."""
     with completed_cards_lock:
         existing = completed_cards.get(chat_id, {}).get(page_id)
         if existing:
@@ -117,7 +124,7 @@ def schedule_completed_deletion(chat_id, page_id, message_id, delay=COMPLETED_AU
         timer.daemon = True
         timer.start()
         completed_cards.setdefault(chat_id, {})[page_id] = {
-            "message_id": message_id,
+            "message_ids": list(message_ids),
             "timer": timer,
         }
 
@@ -140,7 +147,8 @@ def clear_all_completed_cards(chat_id):
             entry["timer"].cancel()
         completed_cards[chat_id] = {}
     for entry in snapshot:
-        delete_message(chat_id, entry["message_id"])
+        for mid in entry["message_ids"]:
+            delete_message(chat_id, mid)
     for pid in page_ids_to_clear:
         notion_mark_visible(pid, False)
 
@@ -677,7 +685,7 @@ def send_video(chat_id, video_url, caption, reply_markup=None, parse_mode=None, 
 
 
 def send_media_group(chat_id, media_items, caption, parse_mode=None):
-    """여러 사진/영상을 album으로 전송. 첫 항목에만 캡션. 첫 메시지 ID 반환.
+    """여러 사진/영상을 album으로 전송. 첫 항목에만 캡션. 전체 메시지 ID 리스트 반환.
 
     file_id가 있으면 다운로드 없이 그대로 재전송(20MB 초과 영상도 OK).
     file_id가 없으면 URL을 다운로드해서 multipart 업로드."""
@@ -706,17 +714,17 @@ def send_media_group(chat_id, media_items, caption, parse_mode=None):
                     item["parse_mode"] = parse_mode
             media.append(item)
         if not media:
-            return None
+            return []
         data = {"chat_id": str(chat_id), "media": json.dumps(media)}
         if files:
             res = requests.post(f"{TELEGRAM_API}/sendMediaGroup", files=files, data=data, timeout=300)
         else:
             res = requests.post(f"{TELEGRAM_API}/sendMediaGroup", data=data, timeout=120)
         result = res.json().get("result", [])
-        return result[0]["message_id"] if result else None
+        return [m["message_id"] for m in result if "message_id" in m]
     except Exception as e:
         print(f"send_media_group error: {e}")
-        return None
+        return []
 
 
 def schedule_ephemeral_deletion(chat_id, message_id, delay=30):
@@ -815,27 +823,30 @@ def send_pending_media_cached(chat_id, page_id, media_type, media_url, caption, 
 
 
 def check_low_stock_alert(chat_id):
-    """재고가 임계값 이하로 떨어지면 알림 (감소 시점에만, 중복 방지)."""
+    """재고가 임계값 이하로 떨어지면 알림, 임계값 초과로 회복되면 알림 삭제."""
     global last_stock_count
     s = get_status_summary()
     new_stock = s["normal_pending"] + s["hold"]
 
     should_alert = False
     if last_stock_count is None:
-        # 첫 관측 — 이미 임계값 이하라면 알림
         if new_stock <= LOW_STOCK_THRESHOLD:
             should_alert = True
     elif last_stock_count > LOW_STOCK_THRESHOLD and new_stock <= LOW_STOCK_THRESHOLD:
-        # 임계값 라인을 넘어 감소
         should_alert = True
 
     if should_alert:
-        send_message(
+        msg_id = send_message(
             chat_id,
             f"⚠️ 재고 부족 경고\n"
-            f"📦 현재 재고: {new_stock}건 (임계값 {LOW_STOCK_THRESHOLD}건 이하)\n"
+            f"📦 현재 재고: {new_stock}건\n"
             f"새 콘텐츠 제작이 필요합니다.",
         )
+        if msg_id:
+            low_stock_alert_messages[chat_id] = msg_id
+    elif new_stock > LOW_STOCK_THRESHOLD and chat_id in low_stock_alert_messages:
+        # 재고 회복 — 기존 경고 메시지 삭제
+        delete_message(chat_id, low_stock_alert_messages.pop(chat_id))
 
     last_stock_count = new_stock
 
@@ -1121,7 +1132,10 @@ def send_pending_list(chat_id, max_items=15):
                 [
                     {"text": "✅ 업로드 완료", "callback_data": f"complete:{data['page_id']}"},
                     {"text": "🚫 보류", "callback_data": f"hold:{data['page_id']}"},
-                ]
+                ],
+                [
+                    {"text": "📝 대본 전달", "callback_data": f"script:{data['page_id']}"},
+                ],
             ]
         }
 
@@ -1190,7 +1204,10 @@ def send_complete_button_reply(chat_id, text, reply_to_message_id, page_id):
             [
                 {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
                 {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
-            ]
+            ],
+            [
+                {"text": "📝 대본 전달", "callback_data": f"script:{page_id}"},
+            ],
         ]
     }
     return send_message(chat_id, text, reply_to_message_id, keyboard)
@@ -1226,7 +1243,10 @@ def send_card(chat_id, media_items, caption_body, page_id, reply_to_message_id=N
                 [
                     {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
                     {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
-                ]
+                ],
+                [
+                    {"text": "📝 대본 전달", "callback_data": f"script:{page_id}"},
+                ],
             ]
         }
     if footer is None:
@@ -1246,9 +1266,8 @@ def send_card(chat_id, media_items, caption_body, page_id, reply_to_message_id=N
 
     sent_ids = []
     if media_count > 1:
-        album_id = send_media_group(chat_id, media_items, caption_body, parse_mode=parse_mode)
-        if album_id:
-            sent_ids.append(album_id)
+        album_ids = send_media_group(chat_id, media_items, caption_body, parse_mode=parse_mode)
+        sent_ids.extend(album_ids)
         # 버튼은 별도 메시지(앨범에는 인라인 버튼 안 됨)
         button_id = send_message(chat_id, footer, reply_markup=keyboard, parse_mode=parse_mode)
         if button_id:
@@ -1406,6 +1425,65 @@ def buffer_media_group(media_group_id, message):
         entry["timer"] = timer
 
 
+def handle_script_submission(chat_id, reply_message_id, prompt_message_id, page_id, script_text):
+    """📝 대본 전달: 안내/답장 메시지 정리 후 사진 + 라벨 + 코드블록 대본 발행."""
+    pending_script_prompts.get(chat_id, {}).pop(prompt_message_id, None)
+    delete_message(chat_id, prompt_message_id)
+    delete_message(chat_id, reply_message_id)
+
+    page = fetch_notion_page(page_id)
+    if not page:
+        send_message(chat_id, "❌ 카드를 찾을 수 없어 대본을 발행하지 못했습니다.")
+        return
+
+    data = extract_item_data(page)
+    media_items = data["media_items"]
+
+    caption_parts = []
+    if data["urgent"]:
+        caption_parts.append("🚨 긴급")
+        caption_parts.append("")
+    caption_parts.append(f"📅 {data['title']}")
+    if data["note"]:
+        caption_parts.append(f"📝 {data['note']}")
+    if data["link"]:
+        caption_parts.append(f"🔗 {data['link']}")
+    caption_parts.append("")
+    caption_parts.append("📝 대본 전달 — 사진/대본을 사용해 직접 업로드해주세요")
+    caption_body = "\n".join(caption_parts)
+
+    new_message_ids = []
+    if len(media_items) > 1:
+        album_ids = send_media_group(chat_id, media_items, caption_body)
+        new_message_ids.extend(album_ids)
+    elif len(media_items) == 1:
+        mtype, url, fid = media_items[0]
+        if mtype == "video":
+            mid = send_video(chat_id, url, caption_body, file_id=fid)
+        else:
+            mid = send_photo(chat_id, url, caption_body, file_id=fid)
+        if mid:
+            new_message_ids.append(mid)
+    else:
+        mid = send_message(chat_id, caption_body)
+        if mid:
+            new_message_ids.append(mid)
+
+    label_id = send_message(chat_id, "📋 대본 ↓ (길게 눌러 복사)")
+    if label_id:
+        new_message_ids.append(label_id)
+
+    safe_script = html_escape(script_text)
+    script_id = send_message(chat_id, f"<pre>{safe_script}</pre>", parse_mode="HTML")
+    if script_id:
+        new_message_ids.append(script_id)
+
+    # 기존 카드의 메시지 묶음에 새 메시지를 합쳐서 ✅ 누를 때 한번에 정리되도록
+    existing = list(get_card_messages(chat_id, page_id))
+    if existing:
+        register_card(chat_id, page_id, existing + new_message_ids)
+
+
 def handle_message(message):
     chat_id = message["chat"]["id"]
     if chat_id != ALLOWED_GROUP_ID:
@@ -1417,6 +1495,15 @@ def handle_message(message):
     video = message.get("video")
     has_media = bool(photos or video)
     media_group_id = message.get("media_group_id")
+
+    # 📝 대본 입력 답장 감지 (Force Reply 프롬프트에 대한 응답)
+    reply_to_msg = message.get("reply_to_message")
+    if reply_to_msg and text and not has_media:
+        prompts = pending_script_prompts.get(chat_id, {})
+        target_page_id = prompts.get(reply_to_msg.get("message_id"))
+        if target_page_id:
+            handle_script_submission(chat_id, message_id, reply_to_msg["message_id"], target_page_id, text)
+            return
 
     # 슬래시 명령어 처리
     if text and not has_media:
@@ -1542,6 +1629,10 @@ def handle_callback_query(callback):
                 f"{TELEGRAM_API}/answerCallbackQuery",
                 json={"callback_query_id": query_id, "text": toast_text},
             )
+            # 카드의 모든 메시지(앨범+버튼) — 완료 시 함께 1시간 후 삭제 예약용
+            related_message_ids = list(get_card_messages(chat_id, page_id)) or [message_id]
+            if message_id not in related_message_ids:
+                related_message_ids.append(message_id)
             # 완료/보류 처리된 카드는 /대기 실행 시 삭제되지 않도록 추적 해제
             unregister_card(chat_id, page_id)
             now_kst = datetime.now(KST).strftime("%m/%d %H:%M")
@@ -1571,7 +1662,7 @@ def handle_callback_query(callback):
             if is_hold:
                 register_hold_card(chat_id, page_id, [message_id])
             else:
-                schedule_completed_deletion(chat_id, page_id, message_id)
+                schedule_completed_deletion(chat_id, page_id, related_message_ids)
         else:
             requests.post(
                 f"{TELEGRAM_API}/answerCallbackQuery",
@@ -1603,7 +1694,10 @@ def handle_callback_query(callback):
                     [
                         {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
                         {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
-                    ]
+                    ],
+                    [
+                        {"text": "📝 대본 전달", "callback_data": f"script:{page_id}"},
+                    ],
                 ]
             }
             edit_message(chat_id, message_id, new_text, has_caption, keyboard)
@@ -1621,6 +1715,28 @@ def handle_callback_query(callback):
                     "show_alert": True,
                 },
             )
+
+    elif data.startswith("script:"):
+        page_id = data.split(":", 1)[1]
+        requests.post(
+            f"{TELEGRAM_API}/answerCallbackQuery",
+            json={"callback_query_id": query_id, "text": "📝 대본 입력창을 열었습니다"},
+        )
+        prompt_text = (
+            "📝 이 메시지에 답장으로 대본을 입력해주세요.\n"
+            "전송하시면 사진/영상과 함께 대본 메시지가 발행됩니다."
+        )
+        prompt_id = send_message(
+            chat_id,
+            prompt_text,
+            reply_to_message_id=message_id,
+            reply_markup={
+                "force_reply": True,
+                "input_field_placeholder": "대본을 여기에 입력하세요",
+            },
+        )
+        if prompt_id:
+            pending_script_prompts.setdefault(chat_id, {})[prompt_id] = page_id
 
     elif data.startswith("discard:"):
         # 1단계: 폐기 확인 다이얼로그 (버튼만 교체)
