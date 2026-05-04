@@ -1426,7 +1426,7 @@ def buffer_media_group(media_group_id, message):
 
 
 def handle_script_submission(chat_id, reply_message_id, prompt_message_id, page_id, script_text):
-    """📝 대본 전달: 안내/답장 메시지 정리 후 사진 + 라벨 + 코드블록 대본 발행."""
+    """📝 대본 전달: 기존 카드 삭제 후 사진 + 라벨(✅/🚫 버튼) + 코드블록 대본 발행."""
     pending_script_prompts.get(chat_id, {}).pop(prompt_message_id, None)
     delete_message(chat_id, prompt_message_id)
     delete_message(chat_id, reply_message_id)
@@ -1452,6 +1452,9 @@ def handle_script_submission(chat_id, reply_message_id, prompt_message_id, page_
     caption_parts.append("📝 대본 전달 — 사진/대본을 사용해 직접 업로드해주세요")
     caption_body = "\n".join(caption_parts)
 
+    # 기존 카드 메시지 삭제 (중복 방지) — 이후 새로 register
+    delete_and_unregister_card(chat_id, page_id)
+
     new_message_ids = []
     if len(media_items) > 1:
         album_ids = send_media_group(chat_id, media_items, caption_body)
@@ -1469,7 +1472,19 @@ def handle_script_submission(chat_id, reply_message_id, prompt_message_id, page_
         if mid:
             new_message_ids.append(mid)
 
-    label_id = send_message(chat_id, "📋 대본 ↓ (길게 눌러 복사)")
+    label_keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
+                {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
+            ]
+        ]
+    }
+    label_id = send_message(
+        chat_id,
+        "📋 대본 ↓ (길게 눌러 복사)",
+        reply_markup=label_keyboard,
+    )
     if label_id:
         new_message_ids.append(label_id)
 
@@ -1478,10 +1493,8 @@ def handle_script_submission(chat_id, reply_message_id, prompt_message_id, page_
     if script_id:
         new_message_ids.append(script_id)
 
-    # 기존 카드의 메시지 묶음에 새 메시지를 합쳐서 ✅ 누를 때 한번에 정리되도록
-    existing = list(get_card_messages(chat_id, page_id))
-    if existing:
-        register_card(chat_id, page_id, existing + new_message_ids)
+    if new_message_ids:
+        register_card(chat_id, page_id, new_message_ids)
 
 
 def handle_message(message):
