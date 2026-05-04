@@ -15,6 +15,7 @@ NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 ALLOWED_GROUP_ID = int(os.getenv("ALLOWED_GROUP_ID"))
 UPLOADER_USER_ID = int(os.getenv("UPLOADER_USER_ID", "8331369727"))
+WEB_APP_URL = os.getenv("WEB_APP_URL", "")  # 대본 입력 미니 앱 URL (https 필수)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 NOTION_API = "https://api.notion.com/v1"
@@ -56,10 +57,6 @@ hold_cards = {}
 
 # 매일 9시 알림: 직전 알림 메시지 ID 추적 (다음날 알림 도착 시 자동 삭제)
 last_daily_notification_msg_id = None
-
-# 대본 입력 대기: {chat_id: {prompt_message_id: page_id}}
-# 📝 대본 전달 버튼 누르면 Force Reply 프롬프트 발행, 답장 도착 시 page_id 매칭에 사용
-pending_script_prompts = {}
 
 
 def register_card(chat_id, page_id, message_ids):
@@ -1127,17 +1124,7 @@ def send_pending_list(chat_id, max_items=15):
             caption_parts.append(f"🔗 {data['link']}")
         caption = "\n".join(caption_parts)
 
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "✅ 업로드 완료", "callback_data": f"complete:{data['page_id']}"},
-                    {"text": "🚫 보류", "callback_data": f"hold:{data['page_id']}"},
-                ],
-                [
-                    {"text": "📝 대본 전달", "callback_data": f"script:{data['page_id']}"},
-                ],
-            ]
-        }
+        keyboard = build_card_keyboard(data["page_id"])
 
         if data["media_url"]:
             mid = send_pending_media_cached(
@@ -1199,18 +1186,7 @@ def delete_message(chat_id, message_id):
 
 
 def send_complete_button_reply(chat_id, text, reply_to_message_id, page_id):
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
-                {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
-            ],
-            [
-                {"text": "📝 대본 전달", "callback_data": f"script:{page_id}"},
-            ],
-        ]
-    }
-    return send_message(chat_id, text, reply_to_message_id, keyboard)
+    return send_message(chat_id, text, reply_to_message_id, build_card_keyboard(page_id))
 
 
 def build_card_caption(title, media_count, note, link, has_video=False, urgent=False):
@@ -1238,17 +1214,7 @@ def send_card(chat_id, media_items, caption_body, page_id, reply_to_message_id=N
     media_items = _normalize_media(media_items)
     media_count = len(media_items)
     if keyboard is None:
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
-                    {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
-                ],
-                [
-                    {"text": "📝 대본 전달", "callback_data": f"script:{page_id}"},
-                ],
-            ]
-        }
+        keyboard = build_card_keyboard(page_id)
     if footer is None:
         footer = "⚡ 즉시 인스타 업로드 후 버튼 눌러주세요👇" if urgent else "인스타에 올린 후 아래 버튼 눌러주세요👇"
 
@@ -1425,16 +1391,60 @@ def buffer_media_group(media_group_id, message):
         entry["timer"] = timer
 
 
-def handle_script_submission(chat_id, reply_message_id, prompt_message_id, page_id, script_text):
-    """📝 대본 전달: 안내/답장 메시지 정리 후 사진 + 라벨 + 코드블록 대본 발행."""
-    pending_script_prompts.get(chat_id, {}).pop(prompt_message_id, None)
-    delete_message(chat_id, prompt_message_id)
-    delete_message(chat_id, reply_message_id)
+def build_card_keyboard(page_id):
+    """카드 인라인 키보드. WEB_APP_URL이 없으면 📝 대본 전달 버튼은 생략."""
+    rows = [
+        [
+            {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
+            {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
+        ]
+    ]
+    if WEB_APP_URL:
+        rows.append([
+            {"text": "📝 대본 전달", "web_app": {"url": f"{WEB_APP_URL}?page_id={page_id}"}},
+        ])
+    return {"inline_keyboard": rows}
+
+
+def update_notion_script(page_id, script_text):
+    """노션 페이지의 '대본' 속성에 텍스트 저장. 2000자씩 나눠서 rich_text 배열로 전달."""
+    chunks = [script_text[i:i + 2000] for i in range(0, len(script_text), 2000)] or [""]
+    rich_text = [{"text": {"content": c}} for c in chunks]
+    try:
+        res = requests.patch(
+            f"{NOTION_API}/pages/{page_id}",
+            headers=NOTION_HEADERS,
+            json={"properties": {"대본": {"rich_text": rich_text}}},
+            timeout=15,
+        )
+        return res.status_code == 200
+    except Exception as e:
+        print(f"update_notion_script error: {e}")
+        return False
+
+
+def handle_web_app_script(chat_id, sender_message_id, raw_data):
+    """📝 미니 앱에서 받은 대본 데이터 처리: 노션 저장 + 사진/라벨/코드블록 대본 발행."""
+    delete_message(chat_id, sender_message_id)  # web_app_data 메시지 정리
+    try:
+        payload = json.loads(raw_data)
+        page_id = payload.get("page_id", "")
+        script_text = (payload.get("script") or "").strip()
+    except Exception as e:
+        print(f"handle_web_app_script parse error: {e}")
+        send_message(chat_id, "❌ 대본 데이터를 해석할 수 없습니다.")
+        return
+
+    if not page_id or not script_text:
+        send_message(chat_id, "❌ 페이지 ID 또는 대본이 비어 있습니다.")
+        return
 
     page = fetch_notion_page(page_id)
     if not page:
         send_message(chat_id, "❌ 카드를 찾을 수 없어 대본을 발행하지 못했습니다.")
         return
+
+    update_notion_script(page_id, script_text)
 
     data = extract_item_data(page)
     media_items = data["media_items"]
@@ -1478,7 +1488,6 @@ def handle_script_submission(chat_id, reply_message_id, prompt_message_id, page_
     if script_id:
         new_message_ids.append(script_id)
 
-    # 기존 카드의 메시지 묶음에 새 메시지를 합쳐서 ✅ 누를 때 한번에 정리되도록
     existing = list(get_card_messages(chat_id, page_id))
     if existing:
         register_card(chat_id, page_id, existing + new_message_ids)
@@ -1496,14 +1505,11 @@ def handle_message(message):
     has_media = bool(photos or video)
     media_group_id = message.get("media_group_id")
 
-    # 📝 대본 입력 답장 감지 (Force Reply 프롬프트에 대한 응답)
-    reply_to_msg = message.get("reply_to_message")
-    if reply_to_msg and text and not has_media:
-        prompts = pending_script_prompts.get(chat_id, {})
-        target_page_id = prompts.get(reply_to_msg.get("message_id"))
-        if target_page_id:
-            handle_script_submission(chat_id, message_id, reply_to_msg["message_id"], target_page_id, text)
-            return
+    # 📝 대본 미니 앱 전송 감지 (web_app_data)
+    web_app_data = message.get("web_app_data")
+    if web_app_data:
+        handle_web_app_script(chat_id, message_id, web_app_data.get("data", ""))
+        return
 
     # 슬래시 명령어 처리
     if text and not has_media:
@@ -1689,17 +1695,7 @@ def handle_callback_query(callback):
                 "",
                 current_text,
             ).rstrip()
-            keyboard = {
-                "inline_keyboard": [
-                    [
-                        {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
-                        {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
-                    ],
-                    [
-                        {"text": "📝 대본 전달", "callback_data": f"script:{page_id}"},
-                    ],
-                ]
-            }
+            keyboard = build_card_keyboard(page_id)
             edit_message(chat_id, message_id, new_text, has_caption, keyboard)
             # 되돌리기로 재고가 회복되었을 수 있으므로 트래커 갱신
             check_low_stock_alert(chat_id)
@@ -1715,28 +1711,6 @@ def handle_callback_query(callback):
                     "show_alert": True,
                 },
             )
-
-    elif data.startswith("script:"):
-        page_id = data.split(":", 1)[1]
-        requests.post(
-            f"{TELEGRAM_API}/answerCallbackQuery",
-            json={"callback_query_id": query_id, "text": "📝 대본 입력창을 열었습니다"},
-        )
-        prompt_text = (
-            "📝 이 메시지에 답장으로 대본을 입력해주세요.\n"
-            "전송하시면 사진/영상과 함께 대본 메시지가 발행됩니다."
-        )
-        prompt_id = send_message(
-            chat_id,
-            prompt_text,
-            reply_to_message_id=message_id,
-            reply_markup={
-                "force_reply": True,
-                "input_field_placeholder": "대본을 여기에 입력하세요",
-            },
-        )
-        if prompt_id:
-            pending_script_prompts.setdefault(chat_id, {})[prompt_id] = page_id
 
     elif data.startswith("discard:"):
         # 폐기: 확인 단계 없이 바로 Notion 보관 + 텔레그램 카드 삭제
