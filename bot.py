@@ -840,17 +840,17 @@ def send_pending_media_cached(chat_id, page_id, media_type, media_url, caption, 
 
 
 def check_low_stock_alert(chat_id):
-    """재고가 임계값 이하로 떨어지면 알림, 임계값 초과로 회복되면 알림 삭제."""
+    """재고가 임계값을 가로질러 떨어지는 순간에만 알림, 회복 시 알림 삭제.
+    봇 시작 시점(last_stock_count is None)에는 알림 발송 X — 재배포 시 중복 방지."""
     global last_stock_count
     s = get_status_summary()
     new_stock = s["normal_pending"] + s["hold"]
 
-    should_alert = False
-    if last_stock_count is None:
-        if new_stock <= LOW_STOCK_THRESHOLD:
-            should_alert = True
-    elif last_stock_count > LOW_STOCK_THRESHOLD and new_stock <= LOW_STOCK_THRESHOLD:
-        should_alert = True
+    should_alert = (
+        last_stock_count is not None
+        and last_stock_count > LOW_STOCK_THRESHOLD
+        and new_stock <= LOW_STOCK_THRESHOLD
+    )
 
     if should_alert:
         msg_id = send_message(
