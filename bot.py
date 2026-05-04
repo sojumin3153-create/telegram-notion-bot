@@ -1683,7 +1683,7 @@ def handle_callback_query(callback):
             check_low_stock_alert(chat_id)
             # 완료는 1시간 후 자동 삭제, 보류는 계속 추적 (둘 다 /복구 중복 방지용 추적)
             if is_hold:
-                register_hold_card(chat_id, page_id, [message_id])
+                register_hold_card(chat_id, page_id, related_message_ids)
             else:
                 schedule_completed_deletion(chat_id, page_id, related_message_ids)
         else:
@@ -1760,7 +1760,7 @@ def handle_callback_query(callback):
             pending_script_prompts.setdefault(chat_id, {})[prompt_id] = page_id
 
     elif data.startswith("discard:"):
-        # 폐기: 확인 단계 없이 바로 Notion 보관 + 텔레그램 카드 삭제
+        # 폐기: 확인 단계 없이 바로 Notion 보관 + 텔레그램 카드(앨범+버튼) 일괄 삭제
         page_id = data.split(":", 1)[1]
         success = archive_notion_page(page_id)
         if success:
@@ -1768,7 +1768,11 @@ def handle_callback_query(callback):
                 f"{TELEGRAM_API}/answerCallbackQuery",
                 json={"callback_query_id": query_id, "text": "🗑 폐기 완료"},
             )
-            delete_message(chat_id, message_id)
+            msg_ids = list(hold_cards.get(chat_id, {}).get(page_id, []))
+            if message_id not in msg_ids:
+                msg_ids.append(message_id)
+            for mid in msg_ids:
+                delete_message(chat_id, mid)
             unregister_card(chat_id, page_id)
             unregister_hold_card(chat_id, page_id)
             cancel_completed_deletion(chat_id, page_id)
