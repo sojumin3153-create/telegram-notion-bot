@@ -1130,11 +1130,9 @@ def send_pending_list(chat_id, max_items=15):
         keyboard = {
             "inline_keyboard": [
                 [
-                    {"text": "✅ 업로드 완료", "callback_data": f"complete:{data['page_id']}"},
+                    {"text": "✅ 완료", "callback_data": f"complete:{data['page_id']}"},
                     {"text": "🚫 보류", "callback_data": f"hold:{data['page_id']}"},
-                ],
-                [
-                    {"text": "📝 대본 전달", "callback_data": f"script:{data['page_id']}"},
+                    {"text": "📝 대본", "callback_data": f"script:{data['page_id']}"},
                 ],
             ]
         }
@@ -1202,11 +1200,9 @@ def send_complete_button_reply(chat_id, text, reply_to_message_id, page_id):
     keyboard = {
         "inline_keyboard": [
             [
-                {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
+                {"text": "✅ 완료", "callback_data": f"complete:{page_id}"},
                 {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
-            ],
-            [
-                {"text": "📝 대본 전달", "callback_data": f"script:{page_id}"},
+                {"text": "📝 대본", "callback_data": f"script:{page_id}"},
             ],
         ]
     }
@@ -1241,11 +1237,9 @@ def send_card(chat_id, media_items, caption_body, page_id, reply_to_message_id=N
         keyboard = {
             "inline_keyboard": [
                 [
-                    {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
+                    {"text": "✅ 완료", "callback_data": f"complete:{page_id}"},
                     {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
-                ],
-                [
-                    {"text": "📝 대본 전달", "callback_data": f"script:{page_id}"},
+                    {"text": "📝 대본", "callback_data": f"script:{page_id}"},
                 ],
             ]
         }
@@ -1475,7 +1469,7 @@ def handle_script_submission(chat_id, reply_message_id, prompt_message_id, page_
     script_keyboard = {
         "inline_keyboard": [
             [
-                {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
+                {"text": "✅ 완료", "callback_data": f"complete:{page_id}"},
                 {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
             ]
         ]
@@ -1702,11 +1696,9 @@ def handle_callback_query(callback):
             keyboard = {
                 "inline_keyboard": [
                     [
-                        {"text": "✅ 업로드 완료", "callback_data": f"complete:{page_id}"},
+                        {"text": "✅ 완료", "callback_data": f"complete:{page_id}"},
                         {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
-                    ],
-                    [
-                        {"text": "📝 대본 전달", "callback_data": f"script:{page_id}"},
+                        {"text": "📝 대본", "callback_data": f"script:{page_id}"},
                     ],
                 ]
             }
