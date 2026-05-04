@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>대본 입력</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--tg-theme-bg-color, #ffffff);
+    color: var(--tg-theme-text-color, #000000);
+  }
+  .container {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    padding: 12px;
+    gap: 8px;
+  }
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 13px;
+    color: var(--tg-theme-hint-color, #6c757d);
+  }
+  .toolbar {
+    display: flex;
+    gap: 6px;
+  }
+  .toolbar button {
+    background: var(--tg-theme-secondary-bg-color, #f1f3f5);
+    color: var(--tg-theme-text-color, #000);
+    border: none;
+    padding: 6px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .toolbar button:active { opacity: 0.6; }
+  textarea {
+    flex: 1;
+    width: 100%;
+    padding: 12px;
+    font-size: 16px;
+    line-height: 1.5;
+    border: 1px solid var(--tg-theme-hint-color, #ced4da);
+    border-radius: 10px;
+    background: var(--tg-theme-bg-color, #fff);
+    color: var(--tg-theme-text-color, #000);
+    resize: none;
+    font-family: inherit;
+  }
+  textarea:focus {
+    outline: 2px solid var(--tg-theme-button-color, #2481cc);
+    outline-offset: -1px;
+  }
+  .footer {
+    font-size: 12px;
+    color: var(--tg-theme-hint-color, #6c757d);
+    text-align: right;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <span id="title">📝 대본 입력</span>
+    <div class="toolbar">
+      <button type="button" id="paste-btn">붙여넣기</button>
+      <button type="button" id="clear-btn">지우기</button>
+    </div>
+  </div>
+  <textarea id="script" placeholder="대본을 여기에 입력하세요..." autofocus></textarea>
+  <div class="footer"><span id="counter">0</span> 자</div>
+</div>
+<script>
+  const tg = window.Telegram.WebApp;
+  tg.ready();
+  tg.expand();
+
+  const params = new URLSearchParams(window.location.search);
+  const pageId = params.get("page_id") || "";
+
+  const ta = document.getElementById("script");
+  const counter = document.getElementById("counter");
+  const pasteBtn = document.getElementById("paste-btn");
+  const clearBtn = document.getElementById("clear-btn");
+
+  function updateCounter() {
+    counter.textContent = ta.value.length.toLocaleString();
+    tg.MainButton.setText(ta.value.trim() ? "대본 전송" : "대본을 입력하세요");
+    if (ta.value.trim()) {
+      tg.MainButton.enable();
+      tg.MainButton.show();
+    } else {
+      tg.MainButton.disable();
+      tg.MainButton.show();
+    }
+  }
+
+  ta.addEventListener("input", updateCounter);
+
+  pasteBtn.addEventListener("click", async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        ta.value = ta.value + text;
+        updateCounter();
+        ta.focus();
+      }
+    } catch (e) {
+      tg.showAlert("클립보드 접근 권한이 없습니다. 텍스트를 길게 눌러 직접 붙여넣어주세요.");
+    }
+  });
+
+  clearBtn.addEventListener("click", () => {
+    if (ta.value && !confirm("입력한 대본을 모두 지울까요?")) return;
+    ta.value = "";
+    updateCounter();
+    ta.focus();
+  });
+
+  tg.MainButton.onClick(() => {
+    const script = ta.value.trim();
+    if (!script) {
+      tg.showAlert("대본을 입력해주세요.");
+      return;
+    }
+    if (!pageId) {
+      tg.showAlert("page_id가 없어 전송할 수 없습니다.");
+      return;
+    }
+    tg.sendData(JSON.stringify({ page_id: pageId, script: script }));
+    tg.close();
+  });
+
+  updateCounter();
+</script>
+</body>
+</html>
