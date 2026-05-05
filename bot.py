@@ -1317,6 +1317,7 @@ def edit_existing_entry(chat_id, page_id, media_items, text, original_message_id
     title = "(제목 없음)"
     existing_link = ""
     existing_note = ""
+    old_media_count = 0
     if page_data:
         props = page_data.get("properties", {})
         title_prop = props.get("날짜", {}).get("title", [])
@@ -1326,6 +1327,7 @@ def edit_existing_entry(chat_id, page_id, media_items, text, original_message_id
         note_arr = props.get("비고", {}).get("rich_text", [])
         if note_arr:
             existing_note = note_arr[0]["plain_text"]
+        old_media_count = len(props.get("사진", {}).get("files", []))
 
     success = update_notion_page_photos(page_id, media_items, new_link, new_note, has_new_text)
     if not success:
@@ -1338,7 +1340,12 @@ def edit_existing_entry(chat_id, page_id, media_items, text, original_message_id
 
     delete_and_unregister_card(chat_id, page_id)
     if old_bot_message:
-        delete_message(chat_id, old_bot_message["message_id"])
+        anchor_id = old_bot_message["message_id"]
+        delete_message(chat_id, anchor_id)
+        # 추적 누락 대비: 앵커 직전 N개 메시지(옛 앨범 항목)도 정리 시도
+        # 텔레그램 앨범+버튼은 연속 ID로 발행되므로 anchor-1 ~ anchor-N 범위가 앨범
+        for offset in range(1, old_media_count + 1):
+            delete_message(chat_id, anchor_id - offset)
 
     for mid in original_message_ids:
         delete_message(chat_id, mid)
