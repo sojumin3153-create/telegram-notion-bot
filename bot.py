@@ -1538,6 +1538,18 @@ def handle_message(message):
         if target_page_id:
             handle_script_submission(chat_id, message_id, reply_to_msg["message_id"], target_page_id, text)
             return
+        # 추적 누락(봇 재시작 등) 시에도 프롬프트 텍스트로 식별해서
+        # save_and_reply로 흘러가 노션에 중복 등록되는 것을 방지
+        prompt_text = reply_to_msg.get("text", "")
+        if prompt_text.startswith("📝 이 메시지에 답장으로 대본을"):
+            warn_id = send_message(
+                chat_id,
+                "⚠️ 입력 세션이 만료됐습니다. 카드의 📝 대본 버튼을 다시 눌러주세요.",
+                reply_to_message_id=message_id,
+            )
+            if warn_id:
+                schedule_ephemeral_deletion(chat_id, warn_id, delay=15)
+            return
 
     # 슬래시 명령어 처리
     if text and not has_media:
