@@ -1500,6 +1500,7 @@ def handle_script_submission(chat_id, reply_message_id, prompt_message_id, page_
             [
                 {"text": "✅ 완료", "callback_data": f"complete:{page_id}"},
                 {"text": "🚫 보류", "callback_data": f"hold:{page_id}"},
+                {"text": "✏️ 수정", "callback_data": f"script:{page_id}"},
             ]
         ]
     }
