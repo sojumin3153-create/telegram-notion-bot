@@ -1150,56 +1150,26 @@ def send_pending_list(chat_id, max_items=15):
 
     for item in items[:max_items]:
         data = extract_item_data(item)
-        caption_parts = []
-        if data["urgent"]:
-            caption_parts.append("🚨 긴급")
-        caption_parts.append(f"📅 {data['title']}")
-        if data["note"]:
-            caption_parts.append(f"📝 {data['note']}")
-        if data["link"]:
-            caption_parts.append(f"🔗 {data['link']}")
-        caption = "\n".join(caption_parts)
-
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "✅ 완료", "callback_data": f"complete:{data['page_id']}"},
-                    {"text": "🚫 보류", "callback_data": f"hold:{data['page_id']}"},
-                    {"text": "📝 대본", "callback_data": f"script:{data['page_id']}"},
-                ],
-            ]
-        }
-
         media_items_list = data["media_items"]
-        media_count = len(media_items_list)
-        if media_count > 1:
-            # 여러 장: send_card로 앨범+버튼 묶음 발행
-            sent_ids = send_card(
-                chat_id,
-                media_items_list,
-                caption,
-                data["page_id"],
-                urgent=data["urgent"],
-                keyboard=keyboard,
-                footer="👇 처리",
-            )
-            if sent_ids:
-                register_card(chat_id, data["page_id"], sent_ids)
-        elif data["media_url"]:
-            mid = send_pending_media_cached(
-                chat_id,
-                data["page_id"],
-                data["media_type"],
-                data["media_url"],
-                caption,
-                keyboard,
-            )
-            if mid:
-                register_card(chat_id, data["page_id"], [mid])
-        else:
-            mid = send_message(chat_id, caption, reply_markup=keyboard)
-            if mid:
-                register_card(chat_id, data["page_id"], [mid])
+        has_video = any(m[0] == "video" for m in media_items_list)
+        caption_body = build_card_caption(
+            data["title"],
+            len(media_items_list),
+            data["note"],
+            data["link"],
+            has_video=has_video,
+            urgent=data["urgent"],
+        )
+        # 원본 카드와 동일한 포맷: 기본 키보드(✅/🚫/📝) + 기본 푸터로 send_card 사용
+        sent_ids = send_card(
+            chat_id,
+            media_items_list,
+            caption_body,
+            data["page_id"],
+            urgent=data["urgent"],
+        )
+        if sent_ids:
+            register_card(chat_id, data["page_id"], sent_ids)
 
     if count > max_items:
         send_message(chat_id, f"...외 {count - max_items}건 더 있음 (Notion에서 확인)")
