@@ -1170,7 +1170,22 @@ def send_pending_list(chat_id, max_items=15):
             ]
         }
 
-        if data["media_url"]:
+        media_items_list = data["media_items"]
+        media_count = len(media_items_list)
+        if media_count > 1:
+            # 여러 장: send_card로 앨범+버튼 묶음 발행
+            sent_ids = send_card(
+                chat_id,
+                media_items_list,
+                caption,
+                data["page_id"],
+                urgent=data["urgent"],
+                keyboard=keyboard,
+                footer="👇 처리",
+            )
+            if sent_ids:
+                register_card(chat_id, data["page_id"], sent_ids)
+        elif data["media_url"]:
             mid = send_pending_media_cached(
                 chat_id,
                 data["page_id"],
@@ -1179,10 +1194,12 @@ def send_pending_list(chat_id, max_items=15):
                 caption,
                 keyboard,
             )
+            if mid:
+                register_card(chat_id, data["page_id"], [mid])
         else:
             mid = send_message(chat_id, caption, reply_markup=keyboard)
-        if mid:
-            register_card(chat_id, data["page_id"], [mid])
+            if mid:
+                register_card(chat_id, data["page_id"], [mid])
 
     if count > max_items:
         send_message(chat_id, f"...외 {count - max_items}건 더 있음 (Notion에서 확인)")
