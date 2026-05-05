@@ -403,7 +403,9 @@ def update_notion_page_photos(page_id, media, new_link=None, new_note=None, has_
             )
         properties["사진"] = {"files": files}
     if has_new_text:
-        properties["참고 링크"] = {"url": new_link} if new_link else {"url": None}
+        # 새 텍스트에서 URL을 뽑아낸 경우에만 링크 갱신, 아니면 기존 링크 그대로 유지
+        if new_link:
+            properties["참고 링크"] = {"url": new_link}
         warn = (
             f"⚠️ 영상 {skipped}개는 20MB 초과로 Notion에 첨부되지 않았습니다 (텔레그램 카드에는 정상 표시)"
             if skipped
@@ -1334,7 +1336,8 @@ def edit_existing_entry(chat_id, page_id, media_items, text, original_message_id
         send_message(chat_id, "❌ 수정 실패", original_message_ids[0])
         return
 
-    show_link = new_link if has_new_text else existing_link
+    # URL이 새로 들어왔을 때만 교체, 아니면 기존 링크 유지
+    show_link = new_link if (has_new_text and new_link) else existing_link
     show_note = new_note if has_new_text else existing_note
     has_video = any(m[0] == "video" for m in media_items)
 
