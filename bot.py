@@ -105,17 +105,31 @@ def clear_all_pending_cards(chat_id):
         notion_mark_visible(pid, False)
 
 
+def _delete_completed_entry_messages(chat_id, page_id, entry):
+    """완료 카드 메시지 삭제 — 추적 ID + 앵커 직전 N개 fallback (옛 카드 대비)."""
+    msg_ids = entry.get("message_ids", [])
+    for mid in msg_ids:
+        delete_message(chat_id, mid)
+    media_count = entry.get("media_count", 0)
+    if msg_ids and media_count:
+        anchor = max(msg_ids)
+        for offset in range(1, media_count + 1):
+            target = anchor - offset
+            if target not in msg_ids:
+                delete_message(chat_id, target)
+
+
 def _delete_completed_card_now(chat_id, page_id):
     with completed_cards_lock:
         entry = completed_cards.get(chat_id, {}).pop(page_id, None)
     if entry:
-        for mid in entry["message_ids"]:
-            delete_message(chat_id, mid)
+        _delete_completed_entry_messages(chat_id, page_id, entry)
         notion_mark_visible(page_id, False)
 
 
-def schedule_completed_deletion(chat_id, page_id, message_ids, delay=COMPLETED_AUTO_DELETE_DELAY):
-    """완료 카드(앨범+버튼 등 관련 메시지 전부)를 N초 뒤 자동 삭제 예약."""
+def schedule_completed_deletion(chat_id, page_id, message_ids, media_count=0, delay=COMPLETED_AUTO_DELETE_DELAY):
+    """완료 카드(앨범+버튼 등 관련 메시지 전부)를 N초 뒤 자동 삭제 예약.
+    media_count: 노션에 등록된 사진/영상 개수 — 추적 누락 시 fallback 삭제용."""
     with completed_cards_lock:
         existing = completed_cards.get(chat_id, {}).get(page_id)
         if existing:
@@ -125,6 +139,7 @@ def schedule_completed_deletion(chat_id, page_id, message_ids, delay=COMPLETED_A
         timer.start()
         completed_cards.setdefault(chat_id, {})[page_id] = {
             "message_ids": list(message_ids),
+            "media_count": media_count,
             "timer": timer,
         }
 
@@ -146,9 +161,8 @@ def clear_all_completed_cards(chat_id):
         for entry in snapshot:
             entry["timer"].cancel()
         completed_cards[chat_id] = {}
-    for entry in snapshot:
-        for mid in entry["message_ids"]:
-            delete_message(chat_id, mid)
+    for pid, entry in zip(page_ids_to_clear, snapshot):
+        _delete_completed_entry_messages(chat_id, pid, entry)
     for pid in page_ids_to_clear:
         notion_mark_visible(pid, False)
 
@@ -1708,7 +1722,12 @@ def handle_callback_query(callback):
             if is_hold:
                 register_hold_card(chat_id, page_id, related_message_ids)
             else:
-                schedule_completed_deletion(chat_id, page_id, related_message_ids)
+                # 노션 사진 개수도 함께 저장 — 추적 누락된 옛 앨범 정리 fallback
+                media_count = 0
+                page_data = fetch_notion_page(page_id)
+                if page_data:
+                    media_count = len(page_data.get("properties", {}).get("사진", {}).get("files", []))
+                schedule_completed_deletion(chat_id, page_id, related_message_ids, media_count=media_count)
         else:
             requests.post(
                 f"{TELEGRAM_API}/answerCallbackQuery",
