@@ -980,12 +980,23 @@ def upgrade_to_urgent(chat_id, page_id, bot_card_message_id):
         return False
     pin_message(chat_id, bot_card_message_id)
     mention = f'<a href="tg://user?id={UPLOADER_USER_ID}">⚡ Song Won</a>님 즉시 확인!'
-    send_message(
+    notif_id = send_message(
         chat_id,
         f"🚨 긴급으로 승격됨\n{mention}",
         reply_to_message_id=bot_card_message_id,
         parse_mode="HTML",
     )
+    # 긴급 알림 메시지도 카드 추적에 합류 → ✅ 완료/🗑 폐기/대기 정리 시 함께 삭제
+    if notif_id:
+        if page_id in pending_cards.get(chat_id, {}):
+            pending_cards[chat_id][page_id].append(notif_id)
+        elif page_id in hold_cards.get(chat_id, {}):
+            hold_cards[chat_id][page_id].append(notif_id)
+        else:
+            with completed_cards_lock:
+                entry = completed_cards.get(chat_id, {}).get(page_id)
+                if entry:
+                    entry["message_ids"].append(notif_id)
     return True
 
 
