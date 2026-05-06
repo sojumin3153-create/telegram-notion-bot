@@ -96,6 +96,22 @@ def get_all_pending_message_ids(chat_id):
     return ids
 
 
+def find_page_id_by_message(chat_id, message_id):
+    """주어진 message_id를 포함하는 page_id를 추적 자료(pending/hold)에서 찾기.
+    앨범 아이템(버튼 없는 미디어)에 답장한 경우 page_id 역추적용."""
+    for pid, msgs in pending_cards.get(chat_id, {}).items():
+        if message_id in msgs:
+            return pid
+    for pid, msgs in hold_cards.get(chat_id, {}).items():
+        if message_id in msgs:
+            return pid
+    with completed_cards_lock:
+        for pid, entry in completed_cards.get(chat_id, {}).items():
+            if message_id in entry.get("message_ids", []):
+                return pid
+    return None
+
+
 def clear_all_pending_cards(chat_id):
     page_ids_to_clear = list(pending_cards.get(chat_id, {}).keys())
     for mid in get_all_pending_message_ids(chat_id):
@@ -1633,6 +1649,9 @@ def handle_message(message):
     reply_to = message.get("reply_to_message")
     if reply_to and reply_to.get("from", {}).get("is_bot") and media_items:
         edit_page_id = extract_page_id_from_message(reply_to)
+        if not edit_page_id:
+            # 버튼 없는 앨범 아이템에 답장한 경우 — 메모리 추적에서 page_id 역추적
+            edit_page_id = find_page_id_by_message(chat_id, reply_to["message_id"])
         if edit_page_id:
             edit_existing_entry(chat_id, edit_page_id, media_items, text, [message_id], reply_to)
             return
