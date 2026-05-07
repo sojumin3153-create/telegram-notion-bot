@@ -35,9 +35,13 @@ media_group_buffer = {}
 media_group_lock = threading.Lock()
 MEDIA_GROUP_DELAY = 3.0  # 초
 
-# /대기 미디어 캐시: {page_id: (media_type, telegram_file_id)}
+# /대기 미디어 캐시: {page_id: (media_type, telegram_file_id)} — 단일 미디어용 (레거시)
 # 같은 사진을 매번 다운로드/업로드하지 않고 file_id로 재사용
 media_cache = {}
+
+# 페이지별 미디어 file_id 리스트: {page_id: [(type, file_id), ...]}
+# 노션 외부 URL이 만료돼도 텔레그램 file_id는 영구 → 재발행 시 사용
+page_media_files = {}
 
 # 재고 부족 알림: 재고(대기+보류) ≤ 임계값으로 떨어지면 그룹에 알림
 LOW_STOCK_THRESHOLD = 5
@@ -79,12 +83,18 @@ def get_card_messages(chat_id, page_id):
 
 
 def delete_and_unregister_card(chat_id, page_id):
-    msgs = get_card_messages(chat_id, page_id)
-    for mid in msgs:
+    """페이지의 모든 추적 메시지(pending/hold/completed) 일괄 삭제 + 추적 해제."""
+    all_msgs = set(get_card_messages(chat_id, page_id))
+    all_msgs.update(hold_cards.get(chat_id, {}).get(page_id, []))
+    with completed_cards_lock:
+        entry = completed_cards.get(chat_id, {}).get(page_id)
+        if entry:
+            all_msgs.update(entry.get("message_ids", []))
+    for mid in all_msgs:
         delete_message(chat_id, mid)
     unregister_card(chat_id, page_id)
-    # 보류 추적도 함께 정리 (/수정으로 보류 카드 교체 시 스테일 방지)
     unregister_hold_card(chat_id, page_id)
+    cancel_completed_deletion(chat_id, page_id)
     # 잠시 안 보임 표시 (직후 새 카드 register 시 다시 True로 돌아감)
     notion_mark_visible(page_id, False)
 
@@ -629,7 +639,8 @@ def extract_item_data(item):
 
     media_items = []
     files = props.get("사진", {}).get("files", [])
-    for f in files:
+    cached_file_ids = page_media_files.get(page_id, [])
+    for i, f in enumerate(files):
         name = f.get("name", "").lower()
         is_video = name.endswith((".mp4", ".mov", ".webm")) or "video" in name
         mtype = "video" if is_video else "photo"
@@ -639,8 +650,12 @@ def extract_item_data(item):
             url = f.get("file", {}).get("url")
         else:
             url = None
-        if url:
-            media_items.append((mtype, url, None))
+        # 캐시된 file_id가 있으면 사용 (노션 외부 URL 만료 대비)
+        file_id = None
+        if i < len(cached_file_ids) and cached_file_ids[i][0] == mtype:
+            file_id = cached_file_ids[i][1]
+        if url or file_id:
+            media_items.append((mtype, url, file_id))
 
     # /대기 호환용: 첫 번째 미디어만 사용
     if media_items:
@@ -801,6 +816,15 @@ def send_status_summary(chat_id):
 def cache_invalidate_media(page_id):
     """수정 또는 사진 변경 시 캐시 무효화."""
     media_cache.pop(page_id, None)
+    page_media_files.pop(page_id, None)
+
+
+def cache_page_media_file_ids(page_id, media_items):
+    """미디어 항목들의 file_id를 page_id별로 캐싱 — 노션 외부 URL 만료 대비.
+    media_items: [(type, url, file_id), ...]."""
+    pairs = [(t, fid) for t, _, fid in media_items if fid]
+    if pairs:
+        page_media_files[page_id] = pairs
 
 
 def send_pending_media_cached(chat_id, page_id, media_type, media_url, caption, keyboard):
@@ -1364,6 +1388,8 @@ def edit_existing_entry(chat_id, page_id, media_items, text, original_message_id
         send_message(chat_id, "❌ 수정 실패", original_message_ids[0])
         return
 
+    cache_page_media_file_ids(page_id, _normalize_media(media_items))
+
     # URL이 새로 들어왔을 때만 교체, 아니면 기존 링크 유지
     show_link = new_link if (has_new_text and new_link) else existing_link
     show_note = new_note if has_new_text else existing_note
@@ -1405,6 +1431,7 @@ def save_and_reply(chat_id, media_items, text, original_message_ids):
         return
 
     page_id = result
+    cache_page_media_file_ids(page_id, _normalize_media(media_items))
     media_count = len(media_items)
     has_video = any(m[0] == "video" for m in media_items)
     caption_body = build_card_caption(title, media_count, note, link, has_video, urgent)
