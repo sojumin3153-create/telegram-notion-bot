@@ -30,10 +30,11 @@ KST = timezone(timedelta(hours=9))
 # 한 카드는 1개 또는 2개 메시지(앨범+버튼) 구성
 pending_cards = {}
 
-# 미디어 그룹 버퍼 (동시에 여러 사진 보낼 때 묶어서 처리)
-media_group_buffer = {}
-media_group_lock = threading.Lock()
-MEDIA_GROUP_DELAY = 3.0  # 초
+# chat 단위 배치 버퍼 — 사진/영상/GIF/링크를 거의 동시에 보내면 묶어서 한 건으로 처리
+# (텔레그램은 사진+GIF는 같은 album으로 못 묶는데, 이 버퍼가 일정 시간 내 모든 메시지를 합침)
+chat_batch_buffer = {}  # {chat_id: {"messages": [...], "timer": Timer}}
+chat_batch_lock = threading.Lock()
+CHAT_BATCH_DELAY = 3.0  # 초 — 마지막 메시지 후 침묵 기간
 
 # /대기 미디어 캐시: {page_id: (media_type, telegram_file_id)} — 단일 미디어용 (레거시)
 # 같은 사진을 매번 다운로드/업로드하지 않고 file_id로 재사용
@@ -1455,37 +1456,37 @@ def save_and_reply(chat_id, media_items, text, original_message_ids):
     register_card(chat_id, page_id, sent_ids)
 
 
-def process_media_group(media_group_id):
-    with media_group_lock:
-        group_data = media_group_buffer.pop(media_group_id, None)
-    if not group_data:
+def process_chat_batch(chat_id):
+    """버퍼에 쌓인 메시지들을 한 건의 노션 엔트리(또는 한 번의 수정)로 처리.
+    text + 모든 미디어(사진/영상/GIF) 합쳐서 처리, 첫 caption/text를 본문으로 사용."""
+    with chat_batch_lock:
+        entry = chat_batch_buffer.pop(chat_id, None)
+    if not entry or not entry["messages"]:
         return
 
-    messages = group_data["messages"]
-    if not messages:
-        return
-
-    chat_id = messages[0]["chat"]["id"]
+    messages = entry["messages"]
 
     text = ""
     for msg in messages:
-        if msg.get("caption"):
-            text = msg["caption"]
-            break
+        cap = msg.get("caption") or msg.get("text") or ""
+        if cap and not text:
+            text = cap
 
-    # 모든 사진/영상 URL 수집
     media_items = []
     for msg in messages:
         media_items.extend(get_media_from_message(msg))
 
     message_ids = [m["message_id"] for m in messages]
 
+    # 답장으로 봇 카드를 수정하려는 케이스
     edit_page_id = None
     old_bot_message = None
     for msg in messages:
         reply_to = msg.get("reply_to_message")
         if reply_to and reply_to.get("from", {}).get("is_bot"):
             pid = extract_page_id_from_message(reply_to)
+            if not pid:
+                pid = find_page_id_by_message(chat_id, reply_to["message_id"])
             if pid:
                 edit_page_id = pid
                 old_bot_message = reply_to
@@ -1497,15 +1498,16 @@ def process_media_group(media_group_id):
         save_and_reply(chat_id, media_items, text, message_ids)
 
 
-def buffer_media_group(media_group_id, message):
-    with media_group_lock:
-        if media_group_id not in media_group_buffer:
-            media_group_buffer[media_group_id] = {"messages": [], "timer": None}
-        entry = media_group_buffer[media_group_id]
+def buffer_chat_message(chat_id, message):
+    """chat 단위 배치 — 마지막 메시지 후 CHAT_BATCH_DELAY 초 침묵 시 일괄 처리."""
+    with chat_batch_lock:
+        if chat_id not in chat_batch_buffer:
+            chat_batch_buffer[chat_id] = {"messages": [], "timer": None}
+        entry = chat_batch_buffer[chat_id]
         if entry["timer"]:
             entry["timer"].cancel()
         entry["messages"].append(message)
-        timer = threading.Timer(MEDIA_GROUP_DELAY, process_media_group, args=[media_group_id])
+        timer = threading.Timer(CHAT_BATCH_DELAY, process_chat_batch, args=[chat_id])
         timer.daemon = True
         timer.start()
         entry["timer"] = timer
@@ -1594,7 +1596,6 @@ def handle_message(message):
     video = message.get("video")
     animation = message.get("animation")
     has_media = bool(photos or video or animation)
-    media_group_id = message.get("media_group_id")
 
     # 📝 대본 입력 답장 감지 (Force Reply 프롬프트에 대한 응답)
     reply_to_msg = message.get("reply_to_message")
@@ -1687,25 +1688,10 @@ def handle_message(message):
     if not has_media and not text:
         return
 
-    if media_group_id:
-        buffer_media_group(media_group_id, message)
-        return
-
-    # 단일 메시지: 사진/영상 추출
-    media_items = get_media_from_message(message)
-
-    # 봇 카드에 답장으로 미디어 보낸 경우 → 수정 모드
-    reply_to = message.get("reply_to_message")
-    if reply_to and reply_to.get("from", {}).get("is_bot") and media_items:
-        edit_page_id = extract_page_id_from_message(reply_to)
-        if not edit_page_id:
-            # 버튼 없는 앨범 아이템에 답장한 경우 — 메모리 추적에서 page_id 역추적
-            edit_page_id = find_page_id_by_message(chat_id, reply_to["message_id"])
-        if edit_page_id:
-            edit_existing_entry(chat_id, edit_page_id, media_items, text, [message_id], reply_to)
-            return
-
-    save_and_reply(chat_id, media_items, text, [message_id])
+    # 모든 미디어/텍스트 메시지를 chat 단위 배치 버퍼에 넣어 일정 시간 침묵 시 일괄 처리.
+    # → album/단일/사진+GIF/링크 따로 보내든 한 건의 노션 엔트리로 묶임.
+    # → 답장으로 봇 카드 수정도 process_chat_batch에서 동일하게 처리.
+    buffer_chat_message(chat_id, message)
 
 
 def edit_message(chat_id, message_id, new_text, has_caption, reply_markup=None):
