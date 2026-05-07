@@ -271,10 +271,11 @@ def get_telegram_file_url(file_id):
 
 
 def get_media_from_message(message):
-    """메시지에서 사진/영상을 추출. [(type, url, file_id), ...] 반환.
+    """메시지에서 사진/영상/GIF를 추출. [(type, url, file_id), ...] 반환.
 
     url은 getFile 가능(<=20MB)할 때만 채워지고, 초과 시 None.
-    file_id는 항상 보존되어 텔레그램 재전송에 사용 가능."""
+    file_id는 항상 보존되어 텔레그램 재전송에 사용 가능.
+    GIF(animation)은 'video' 타입으로 정규화 (mp4 인코딩되어 인스타 업로드용으론 동등)."""
     items = []
     photos = message.get("photo", [])
     if photos:
@@ -285,6 +286,11 @@ def get_media_from_message(message):
     video = message.get("video")
     if video:
         file_id = video["file_id"]
+        url = get_telegram_file_url(file_id)
+        items.append(("video", url, file_id))
+    animation = message.get("animation")
+    if animation:
+        file_id = animation["file_id"]
         url = get_telegram_file_url(file_id)
         items.append(("video", url, file_id))
     return items
@@ -1586,7 +1592,8 @@ def handle_message(message):
     text = message.get("caption") or message.get("text") or ""
     photos = message.get("photo", [])
     video = message.get("video")
-    has_media = bool(photos or video)
+    animation = message.get("animation")
+    has_media = bool(photos or video or animation)
     media_group_id = message.get("media_group_id")
 
     # 📝 대본 입력 답장 감지 (Force Reply 프롬프트에 대한 응답)
