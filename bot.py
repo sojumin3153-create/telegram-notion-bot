@@ -145,17 +145,51 @@ def _delete_completed_entry_messages(chat_id, page_id, entry):
                 delete_message(chat_id, target)
 
 
+def _save_complete_meta_to_notion(page_id, message_ids, media_count, scheduled_at):
+    """완료 카드 추적 메타데이터를 노션 'tg_complete_meta' 속성에 JSON으로 저장.
+    봇 재시작 후 타이머 복원에 사용."""
+    meta = json.dumps({
+        "msg_ids": list(message_ids),
+        "media_count": media_count,
+        "scheduled_at": scheduled_at,
+    })
+    try:
+        requests.patch(
+            f"{NOTION_API}/pages/{page_id}",
+            headers=NOTION_HEADERS,
+            json={"properties": {"tg_complete_meta": {"rich_text": [{"text": {"content": meta}}]}}},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"_save_complete_meta_to_notion error: {e}")
+
+
+def _clear_complete_meta_in_notion(page_id):
+    try:
+        requests.patch(
+            f"{NOTION_API}/pages/{page_id}",
+            headers=NOTION_HEADERS,
+            json={"properties": {"tg_complete_meta": {"rich_text": []}}},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"_clear_complete_meta_in_notion error: {e}")
+
+
 def _delete_completed_card_now(chat_id, page_id):
     with completed_cards_lock:
         entry = completed_cards.get(chat_id, {}).pop(page_id, None)
     if entry:
         _delete_completed_entry_messages(chat_id, page_id, entry)
         notion_mark_visible(page_id, False)
+    _clear_complete_meta_in_notion(page_id)
 
 
 def schedule_completed_deletion(chat_id, page_id, message_ids, media_count=0, delay=COMPLETED_AUTO_DELETE_DELAY):
     """완료 카드(앨범+버튼 등 관련 메시지 전부)를 N초 뒤 자동 삭제 예약.
-    media_count: 노션에 등록된 사진/영상 개수 — 추적 누락 시 fallback 삭제용."""
+    media_count: 노션에 등록된 사진/영상 개수 — 추적 누락 시 fallback 삭제용.
+    노션에도 메타데이터 저장하여 봇 재시작 시 타이머 복원."""
+    scheduled_at = time.time()
     with completed_cards_lock:
         existing = completed_cards.get(chat_id, {}).get(page_id)
         if existing:
@@ -166,8 +200,10 @@ def schedule_completed_deletion(chat_id, page_id, message_ids, media_count=0, de
         completed_cards.setdefault(chat_id, {})[page_id] = {
             "message_ids": list(message_ids),
             "media_count": media_count,
+            "scheduled_at": scheduled_at,
             "timer": timer,
         }
+    _save_complete_meta_to_notion(page_id, message_ids, media_count, scheduled_at)
 
 
 def cancel_completed_deletion(chat_id, page_id):
@@ -176,6 +212,7 @@ def cancel_completed_deletion(chat_id, page_id):
         entry = completed_cards.get(chat_id, {}).pop(page_id, None)
     if entry:
         entry["timer"].cancel()
+    _clear_complete_meta_in_notion(page_id)
 
 
 def clear_all_completed_cards(chat_id):
@@ -1922,9 +1959,76 @@ def daily_scheduler():
             time.sleep(300)
 
 
+def restore_completed_timers():
+    """봇 시작 시 노션에서 완료 카드 메타 조회하여 자동 삭제 타이머 복원."""
+    body = {
+        "filter": {
+            "and": [
+                {"property": "상태", "select": {"equals": "업로드완료"}},
+                {"property": "tg_complete_meta", "rich_text": {"is_not_empty": True}},
+            ]
+        }
+    }
+    try:
+        res = requests.post(
+            f"{NOTION_API}/databases/{DATABASE_ID}/query",
+            headers=NOTION_HEADERS,
+            json=body,
+            timeout=15,
+        )
+        if res.status_code != 200:
+            print(f"완료 카드 복원 실패: {res.status_code}")
+            return
+    except Exception as e:
+        print(f"완료 카드 복원 에러: {e}")
+        return
+
+    items = res.json().get("results", [])
+    now = time.time()
+    restored = 0
+    expired = 0
+    for item in items:
+        page_id = item["id"]
+        rich_text = item.get("properties", {}).get("tg_complete_meta", {}).get("rich_text", [])
+        if not rich_text:
+            continue
+        try:
+            meta = json.loads(rich_text[0].get("plain_text", ""))
+        except Exception:
+            continue
+        msg_ids = meta.get("msg_ids", [])
+        media_count = meta.get("media_count", 0)
+        scheduled_at = meta.get("scheduled_at", now)
+        elapsed = now - scheduled_at
+        remaining = COMPLETED_AUTO_DELETE_DELAY - elapsed
+        if remaining <= 0:
+            # 1시간 이미 지남 — 즉시 삭제 시도
+            entry = {"message_ids": msg_ids, "media_count": media_count}
+            _delete_completed_entry_messages(ALLOWED_GROUP_ID, page_id, entry)
+            notion_mark_visible(page_id, False)
+            _clear_complete_meta_in_notion(page_id)
+            expired += 1
+            continue
+        timer = threading.Timer(remaining, _delete_completed_card_now, args=[ALLOWED_GROUP_ID, page_id])
+        timer.daemon = True
+        timer.start()
+        with completed_cards_lock:
+            completed_cards.setdefault(ALLOWED_GROUP_ID, {})[page_id] = {
+                "message_ids": msg_ids,
+                "media_count": media_count,
+                "scheduled_at": scheduled_at,
+                "timer": timer,
+            }
+        restored += 1
+    if restored or expired:
+        print(f"📂 완료 카드 복원: 타이머 {restored}건 재예약, 만료 {expired}건 즉시 정리")
+
+
 def main():
     print("🤖 봇 시작됨")
     print(f"   감시 그룹 ID: {ALLOWED_GROUP_ID}")
+
+    restore_completed_timers()
 
     scheduler_thread = threading.Thread(target=daily_scheduler, daemon=True)
     scheduler_thread.start()
