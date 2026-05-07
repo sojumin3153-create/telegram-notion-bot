@@ -34,7 +34,7 @@ pending_cards = {}
 # (텔레그램은 사진+GIF는 같은 album으로 못 묶는데, 이 버퍼가 일정 시간 내 모든 메시지를 합침)
 chat_batch_buffer = {}  # {chat_id: {"messages": [...], "timer": Timer}}
 chat_batch_lock = threading.Lock()
-CHAT_BATCH_DELAY = 3.0  # 초 — 마지막 메시지 후 침묵 기간
+CHAT_BATCH_DELAY = 5.0  # 초 — 마지막 메시지 후 침묵 기간 (GIF 도착 지연 대비 여유 확보)
 
 # /대기 미디어 캐시: {page_id: (media_type, telegram_file_id)} — 단일 미디어용 (레거시)
 # 같은 사진을 매번 다운로드/업로드하지 않고 file_id로 재사용
@@ -294,6 +294,15 @@ def get_media_from_message(message):
         file_id = animation["file_id"]
         url = get_telegram_file_url(file_id)
         items.append(("video", url, file_id))
+    # GIF가 document로 들어오는 경우(파일 형태로 전송 / 일부 클라이언트) 대응
+    document = message.get("document")
+    if document:
+        mime = document.get("mime_type", "")
+        if mime.startswith("image/") or mime.startswith("video/"):
+            file_id = document["file_id"]
+            url = get_telegram_file_url(file_id)
+            mtype = "video" if mime.startswith("video/") or mime == "image/gif" else "photo"
+            items.append((mtype, url, file_id))
     return items
 
 
@@ -1595,7 +1604,12 @@ def handle_message(message):
     photos = message.get("photo", [])
     video = message.get("video")
     animation = message.get("animation")
-    has_media = bool(photos or video or animation)
+    document = message.get("document")
+    doc_is_media = False
+    if document:
+        mime = document.get("mime_type", "")
+        doc_is_media = mime.startswith("image/") or mime.startswith("video/")
+    has_media = bool(photos or video or animation or doc_is_media)
 
     # 📝 대본 입력 답장 감지 (Force Reply 프롬프트에 대한 응답)
     reply_to_msg = message.get("reply_to_message")
