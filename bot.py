@@ -66,9 +66,37 @@ last_daily_notification_msg_id = None
 pending_script_prompts = {}
 
 
+def _save_pending_meta_to_notion(page_id, message_ids):
+    """pending 카드의 message_id 리스트를 노션 'tg_pending_meta'에 영속 저장.
+    봇 재시작 후에도 옛 카드를 정확히 식별/삭제하기 위함."""
+    meta = json.dumps({"msg_ids": list(message_ids)})
+    try:
+        requests.patch(
+            f"{NOTION_API}/pages/{page_id}",
+            headers=NOTION_HEADERS,
+            json={"properties": {"tg_pending_meta": {"rich_text": [{"text": {"content": meta}}]}}},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"_save_pending_meta_to_notion error: {e}")
+
+
+def _clear_pending_meta_in_notion(page_id):
+    try:
+        requests.patch(
+            f"{NOTION_API}/pages/{page_id}",
+            headers=NOTION_HEADERS,
+            json={"properties": {"tg_pending_meta": {"rich_text": []}}},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"_clear_pending_meta_in_notion error: {e}")
+
+
 def register_card(chat_id, page_id, message_ids):
     pending_cards.setdefault(chat_id, {})[page_id] = list(message_ids)
     notion_mark_visible(page_id, True)
+    _save_pending_meta_to_notion(page_id, message_ids)
 
 
 def unregister_card(chat_id, page_id):
@@ -76,10 +104,28 @@ def unregister_card(chat_id, page_id):
     # → Notion 표시중은 건드리지 않음
     if chat_id in pending_cards:
         pending_cards[chat_id].pop(page_id, None)
+    _clear_pending_meta_in_notion(page_id)
 
 
 def get_card_messages(chat_id, page_id):
-    return pending_cards.get(chat_id, {}).get(page_id, [])
+    """추적된 message_ids 반환. 메모리에 없으면 노션에서 즉시 폴백 조회."""
+    msgs = pending_cards.get(chat_id, {}).get(page_id, [])
+    if msgs:
+        return msgs
+    # 메모리에 없음 → 노션에서 시도 (봇 재시작 직후 케이스 대비)
+    try:
+        r = requests.get(f"{NOTION_API}/pages/{page_id}", headers=NOTION_HEADERS, timeout=10)
+        if r.status_code == 200:
+            rich = r.json().get("properties", {}).get("tg_pending_meta", {}).get("rich_text", [])
+            if rich:
+                meta = json.loads(rich[0].get("plain_text", ""))
+                msg_ids = meta.get("msg_ids", [])
+                if msg_ids:
+                    pending_cards.setdefault(chat_id, {})[page_id] = list(msg_ids)
+                    return list(msg_ids)
+    except Exception as e:
+        print(f"get_card_messages notion fallback error: {e}")
+    return []
 
 
 def delete_and_unregister_card(chat_id, page_id):
@@ -2024,10 +2070,47 @@ def restore_completed_timers():
         print(f"📂 완료 카드 복원: 타이머 {restored}건 재예약, 만료 {expired}건 즉시 정리")
 
 
+def restore_pending_from_notion():
+    """봇 시작 시 노션에서 pending 카드 메타 조회하여 메모리 복원."""
+    body = {"filter": {"property": "tg_pending_meta", "rich_text": {"is_not_empty": True}}}
+    try:
+        res = requests.post(
+            f"{NOTION_API}/databases/{DATABASE_ID}/query",
+            headers=NOTION_HEADERS,
+            json=body,
+            timeout=15,
+        )
+        if res.status_code != 200:
+            print(f"pending 복원 실패: {res.status_code}")
+            return
+    except Exception as e:
+        print(f"pending 복원 에러: {e}")
+        return
+
+    items = res.json().get("results", [])
+    restored = 0
+    for item in items:
+        page_id = item["id"]
+        rich_text = item.get("properties", {}).get("tg_pending_meta", {}).get("rich_text", [])
+        if not rich_text:
+            continue
+        try:
+            meta = json.loads(rich_text[0].get("plain_text", ""))
+        except Exception:
+            continue
+        msg_ids = meta.get("msg_ids", [])
+        if msg_ids:
+            pending_cards.setdefault(ALLOWED_GROUP_ID, {})[page_id] = list(msg_ids)
+            restored += 1
+    if restored:
+        print(f"📂 pending 카드 {restored}건 복원됨")
+
+
 def main():
     print("🤖 봇 시작됨")
     print(f"   감시 그룹 ID: {ALLOWED_GROUP_ID}")
 
+    restore_pending_from_notion()
     restore_completed_timers()
 
     scheduler_thread = threading.Thread(target=daily_scheduler, daemon=True)
