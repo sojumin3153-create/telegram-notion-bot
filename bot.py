@@ -1588,8 +1588,9 @@ def buffer_media_group(media_group_id, message):
         entry["timer"] = timer
 
 
-def handle_script_submission(chat_id, reply_message_id, prompt_message_id, page_id, script_text):
-    """📝 대본 전달: 기존 카드 삭제 후 사진 + 라벨(✅/🚫 버튼) + 코드블록 대본 발행."""
+def handle_script_submission(chat_id, reply_message_id, prompt_message_id, page_id, script_text, anchor_id=None):
+    """📝 대본 전달: 기존 카드 삭제 후 사진 + 라벨(✅/🚫 버튼) + 코드블록 대본 발행.
+    anchor_id: 사용자가 클릭한 버튼 메시지 ID — 옛 카드(영속화 이전 발행) fallback 정리용."""
     pending_script_prompts.get(chat_id, {}).pop(prompt_message_id, None)
     delete_message(chat_id, prompt_message_id)
     delete_message(chat_id, reply_message_id)
@@ -1603,6 +1604,7 @@ def handle_script_submission(chat_id, reply_message_id, prompt_message_id, page_
 
     data = extract_item_data(page)
     media_items = data["media_items"]
+    old_media_count = len(page.get("properties", {}).get("사진", {}).get("files", []))
 
     caption_parts = []
     if data["urgent"]:
@@ -1619,6 +1621,13 @@ def handle_script_submission(chat_id, reply_message_id, prompt_message_id, page_
 
     # 기존 카드 메시지 삭제 (중복 방지) — 이후 새로 register
     delete_and_unregister_card(chat_id, page_id)
+
+    # 옛 카드(노션 메타 영속화 이전 발행) fallback — 앵커 직전 N개 ID 시도 삭제
+    # 텔레그램 앨범+버튼은 연속 ID로 발행되므로 anchor-N ~ anchor가 옛 카드 영역
+    if anchor_id:
+        delete_message(chat_id, anchor_id)
+        for offset in range(1, old_media_count + 1):
+            delete_message(chat_id, anchor_id - offset)
 
     new_message_ids = []
     if len(media_items) > 1:
@@ -1676,9 +1685,17 @@ def handle_message(message):
     reply_to_msg = message.get("reply_to_message")
     if reply_to_msg and text and not has_media:
         prompts = pending_script_prompts.get(chat_id, {})
-        target_page_id = prompts.get(reply_to_msg.get("message_id"))
-        if target_page_id:
-            handle_script_submission(chat_id, message_id, reply_to_msg["message_id"], target_page_id, text)
+        target = prompts.get(reply_to_msg.get("message_id"))
+        if target:
+            # 하위 호환: 옛 포맷(page_id 단독) 또는 새 포맷((page_id, anchor_id)) 모두 처리
+            if isinstance(target, tuple):
+                target_page_id, anchor_id = target
+            else:
+                target_page_id, anchor_id = target, None
+            handle_script_submission(
+                chat_id, message_id, reply_to_msg["message_id"],
+                target_page_id, text, anchor_id=anchor_id,
+            )
             return
         # 추적 누락(봇 재시작 등) 시에도 프롬프트 텍스트로 식별해서
         # save_and_reply로 흘러가 노션에 중복 등록되는 것을 방지
@@ -1930,7 +1947,8 @@ def handle_callback_query(callback):
             },
         )
         if prompt_id:
-            pending_script_prompts.setdefault(chat_id, {})[prompt_id] = page_id
+            # message_id(=클릭한 버튼 메시지)를 anchor로 함께 저장 → 옛 카드 fallback 정리용
+            pending_script_prompts.setdefault(chat_id, {})[prompt_id] = (page_id, message_id)
 
     elif data.startswith("discard:"):
         # 폐기: 확인 단계 없이 바로 Notion 보관 + 텔레그램 카드(앨범+버튼) 일괄 삭제
