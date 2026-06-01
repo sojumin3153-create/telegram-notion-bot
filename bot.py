@@ -2128,8 +2128,15 @@ def main():
     print("🤖 봇 시작됨")
     print(f"   감시 그룹 ID: {ALLOWED_GROUP_ID}")
 
-    restore_pending_from_notion()
-    restore_completed_timers()
+    # 복원 함수가 예외를 던져도 봇 폴링은 살아남도록 안전망 추가
+    try:
+        restore_pending_from_notion()
+    except Exception as e:
+        print(f"⚠️ restore_pending_from_notion failed (계속 진행): {e}")
+    try:
+        restore_completed_timers()
+    except Exception as e:
+        print(f"⚠️ restore_completed_timers failed (계속 진행): {e}")
 
     scheduler_thread = threading.Thread(target=daily_scheduler, daemon=True)
     scheduler_thread.start()
