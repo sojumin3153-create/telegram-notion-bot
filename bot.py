@@ -53,6 +53,7 @@ low_stock_alert_messages = {}  # {chat_id: message_id} — 재고 회복 시 삭
 completed_cards = {}
 completed_cards_lock = threading.Lock()
 COMPLETED_AUTO_DELETE_DELAY = 3600  # 1시간 (초)
+COMPLETED_SWEEP_INTERVAL = 600  # 완료 카드 자가 치유 스위프 주기(초) — 유실 타이머/실패 삭제 재시도
 
 # 보류 카드 추적: {chat_id: {page_id: [message_ids]}}
 # /복구가 이미 표시 중인 카드를 중복 등록하지 않도록 사용
@@ -178,17 +179,21 @@ def clear_all_pending_cards(chat_id):
 
 
 def _delete_completed_entry_messages(chat_id, page_id, entry):
-    """완료 카드 메시지 삭제 — 추적 ID + 앵커 직전 N개 fallback (옛 카드 대비)."""
+    """완료 카드 메시지 삭제 — 추적 ID + 앵커 직전 N개 fallback (옛 카드 대비).
+    추적 ID(msg_ids)가 모두 삭제 성공했는지 여부를 반환 → 실패 시 메타 유지·재시도용."""
     msg_ids = entry.get("message_ids", [])
+    all_ok = True
     for mid in msg_ids:
-        delete_message(chat_id, mid)
+        if not delete_message(chat_id, mid):
+            all_ok = False
     media_count = entry.get("media_count", 0)
     if msg_ids and media_count:
         anchor = max(msg_ids)
         for offset in range(1, media_count + 1):
             target = anchor - offset
             if target not in msg_ids:
-                delete_message(chat_id, target)
+                delete_message(chat_id, target)  # fallback(추정) — 성공 여부는 판정에 미포함
+    return all_ok
 
 
 def _save_complete_meta_to_notion(page_id, message_ids, media_count, scheduled_at):
@@ -199,15 +204,23 @@ def _save_complete_meta_to_notion(page_id, message_ids, media_count, scheduled_a
         "media_count": media_count,
         "scheduled_at": scheduled_at,
     })
-    try:
-        requests.patch(
-            f"{NOTION_API}/pages/{page_id}",
-            headers=NOTION_HEADERS,
-            json={"properties": {"tg_complete_meta": {"rich_text": [{"text": {"content": meta}}]}}},
-            timeout=10,
-        )
-    except Exception as e:
-        print(f"_save_complete_meta_to_notion error: {e}")
+    body = {"properties": {"tg_complete_meta": {"rich_text": [{"text": {"content": meta}}]}}}
+    # 이 저장이 실패하면 재시작 후 복원 불가 → 고아 카드가 됨. 상태 확인 + 1회 재시도.
+    for attempt in range(2):
+        try:
+            res = requests.patch(
+                f"{NOTION_API}/pages/{page_id}",
+                headers=NOTION_HEADERS,
+                json=body,
+                timeout=10,
+            )
+            if res.status_code == 200:
+                return True
+            print(f"_save_complete_meta_to_notion 실패({res.status_code}): {res.text[:200]}")
+        except Exception as e:
+            print(f"_save_complete_meta_to_notion 예외: {e}")
+        time.sleep(1)
+    return False
 
 
 def _clear_complete_meta_in_notion(page_id):
@@ -226,9 +239,15 @@ def _delete_completed_card_now(chat_id, page_id):
     with completed_cards_lock:
         entry = completed_cards.get(chat_id, {}).pop(page_id, None)
     if entry:
-        _delete_completed_entry_messages(chat_id, page_id, entry)
-        notion_mark_visible(page_id, False)
-    _clear_complete_meta_in_notion(page_id)
+        ok = _delete_completed_entry_messages(chat_id, page_id, entry)
+        if ok:
+            notion_mark_visible(page_id, False)
+            _clear_complete_meta_in_notion(page_id)
+        else:
+            # 삭제 실패 → 메타/표시중 유지해서 주기 스위퍼가 재시도 (추적 유실 방지)
+            print(f"완료 카드 삭제 실패 — 메타 유지하여 재시도 예정: {page_id}")
+    else:
+        _clear_complete_meta_in_notion(page_id)
 
 
 def schedule_completed_deletion(chat_id, page_id, message_ids, media_count=0, delay=COMPLETED_AUTO_DELETE_DELAY):
@@ -1344,14 +1363,26 @@ def pin_message(chat_id, message_id, disable_notification=False):
 
 
 def delete_message(chat_id, message_id):
+    """메시지 삭제. 성공/이미없음이면 True, 삭제 실패면 False 반환(+사유 로그).
+    실패 사유를 남겨야 어떤 카드가 왜 안 지워지는지 추적 가능."""
     try:
-        requests.post(
+        res = requests.post(
             f"{TELEGRAM_API}/deleteMessage",
             json={"chat_id": chat_id, "message_id": message_id},
             timeout=10,
         )
-    except Exception:
-        pass
+        data = res.json()
+        if data.get("ok"):
+            return True
+        desc = (data.get("description") or "").lower()
+        # 이미 삭제됐거나 존재하지 않으면 목적은 달성된 것 → 성공 취급
+        if "not found" in desc or "message to delete" in desc:
+            return True
+        print(f"delete_message 실패 (mid={message_id}): {data.get('description')}")
+        return False
+    except Exception as e:
+        print(f"delete_message 예외 (mid={message_id}): {e}")
+        return False
 
 
 def send_complete_button_reply(chat_id, text, reply_to_message_id, page_id):
@@ -2041,6 +2072,19 @@ def daily_scheduler():
             time.sleep(300)
 
 
+def completed_sweeper():
+    """완료 카드 자가 치유 루프. 매 주기마다 Notion 메타를 재확인해
+    재시작으로 유실된 타이머를 재등록하고, 삭제에 실패해 남아있는 카드를 재삭제 시도.
+    메모리가 아니라 Notion을 기준으로 재확인하므로 재배포·크래시에도 견고."""
+    print(f"🧹 완료 카드 스위퍼 시작 (매 {COMPLETED_SWEEP_INTERVAL}s)")
+    while True:
+        time.sleep(COMPLETED_SWEEP_INTERVAL)
+        try:
+            restore_completed_timers()
+        except Exception as e:
+            print(f"completed_sweeper error: {e}")
+
+
 def restore_completed_timers():
     """봇 시작 시 노션에서 완료 카드 메타 조회하여 자동 삭제 타이머 복원."""
     body = {
@@ -2069,6 +2113,7 @@ def restore_completed_timers():
     now = time.time()
     restored = 0
     expired = 0
+    failed = 0
     for item in items:
         page_id = item["id"]
         rich_text = item.get("properties", {}).get("tg_complete_meta", {}).get("rich_text", [])
@@ -2078,18 +2123,25 @@ def restore_completed_timers():
             meta = json.loads(rich_text[0].get("plain_text", ""))
         except Exception:
             continue
+        # 이미 활성 타이머가 있으면 중복 등록 방지 → 스위퍼가 반복 호출해도 안전(멱등)
+        with completed_cards_lock:
+            if page_id in completed_cards.get(ALLOWED_GROUP_ID, {}):
+                continue
         msg_ids = meta.get("msg_ids", [])
         media_count = meta.get("media_count", 0)
         scheduled_at = meta.get("scheduled_at", now)
         elapsed = now - scheduled_at
         remaining = COMPLETED_AUTO_DELETE_DELAY - elapsed
         if remaining <= 0:
-            # 1시간 이미 지남 — 즉시 삭제 시도
+            # 삭제 시간 지남 — 즉시 삭제 시도. 성공했을 때만 메타/표시중 정리.
+            # 실패하면 메타를 남겨 다음 스위프에서 재시도(추적 유실 방지).
             entry = {"message_ids": msg_ids, "media_count": media_count}
-            _delete_completed_entry_messages(ALLOWED_GROUP_ID, page_id, entry)
-            notion_mark_visible(page_id, False)
-            _clear_complete_meta_in_notion(page_id)
-            expired += 1
+            if _delete_completed_entry_messages(ALLOWED_GROUP_ID, page_id, entry):
+                notion_mark_visible(page_id, False)
+                _clear_complete_meta_in_notion(page_id)
+                expired += 1
+            else:
+                failed += 1
             continue
         timer = threading.Timer(remaining, _delete_completed_card_now, args=[ALLOWED_GROUP_ID, page_id])
         timer.daemon = True
@@ -2102,8 +2154,9 @@ def restore_completed_timers():
                 "timer": timer,
             }
         restored += 1
-    if restored or expired:
-        print(f"📂 완료 카드 복원: 타이머 {restored}건 재예약, 만료 {expired}건 즉시 정리")
+    if restored or expired or failed:
+        print(f"📂 완료 카드 정리: 타이머 {restored}건 재예약, 만료삭제 {expired}건, 삭제실패(재시도예정) {failed}건")
+    return {"restored": restored, "expired": expired, "failed": failed}
 
 
 def restore_pending_from_notion():
@@ -2158,6 +2211,10 @@ def main():
 
     scheduler_thread = threading.Thread(target=daily_scheduler, daemon=True)
     scheduler_thread.start()
+
+    # 완료 카드 자가 치유 스위퍼 — 유실 타이머/실패 삭제를 주기적으로 재시도
+    sweeper_thread = threading.Thread(target=completed_sweeper, daemon=True)
+    sweeper_thread.start()
 
     offset = None
     while True:
