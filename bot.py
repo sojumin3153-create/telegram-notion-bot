@@ -1368,8 +1368,8 @@ def send_complete_button_reply(chat_id, text, reply_to_message_id, page_id):
 
 
 def build_card_caption(title, media_count, note, link, has_video=False, urgent=False):
-    # 카드는 항상 HTML 모드로 전송되므로 평문 부분(title/note)은 이스케이프.
-    # 출처 링크는 <code>로 감싸 '탭하면 복사'되게 함.
+    # 카드는 항상 HTML 모드로 전송되므로 평문 부분은 이스케이프.
+    # 비고 안의 '출처: ~~~' 줄은 통째로 <code>로 감싸 '탭하면 복사'되게 함.
     parts = []
     if urgent:
         parts.append("🚨🚨🚨 긴급 콘텐츠 🚨🚨🚨")
@@ -1378,12 +1378,30 @@ def build_card_caption(title, media_count, note, link, has_video=False, urgent=F
     if media_count > 1:
         label = "미디어" if has_video else "사진"
         parts.append(f"🖼 {label} {media_count}개")
+
+    # 비고를 줄 단위로 분리: '출처'로 시작하는 줄은 복사용으로 따로 처리
+    source_lines = []
+    other_lines = []
     if note:
-        parts.append(f"📝 {html_escape(note)}")
-    if link:
-        # 탭하면 URL만 정확히 복사되도록 링크를 별도 줄 <code>로
+        for line in note.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("출처"):
+                source_lines.append(stripped)
+            else:
+                other_lines.append(stripped)
+
+    if other_lines:
+        parts.append("📝 " + html_escape("\n".join(other_lines)))
+    if source_lines:
+        # '출처: ~~~' 줄을 탭하면 그 줄 전체가 클립보드로 복사됨
         parts.append("📋 출처(탭하면 복사):")
-        parts.append(f"<code>{html_escape(link)}</code>")
+        for s in source_lines:
+            parts.append(f"<code>{html_escape(s)}</code>")
+    if link:
+        # URL은 출처가 아니라 '열리는 링크'로 표시 (탭하면 브라우저에서 열림)
+        parts.append(f"🔗 {html_escape(link)}")
     return "\n".join(parts)
 
 
