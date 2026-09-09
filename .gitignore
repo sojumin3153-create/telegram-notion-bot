@@ -4,3 +4,9 @@ __pycache__/
 .DS_Store
 venv/
 .venv/
+
+# macOS 외장하드(exFAT) AppleDouble 메타데이터
+._*
+.AppleDouble
+.Spotlight-V100
+.Trashes

@@ -1368,18 +1368,22 @@ def send_complete_button_reply(chat_id, text, reply_to_message_id, page_id):
 
 
 def build_card_caption(title, media_count, note, link, has_video=False, urgent=False):
+    # 카드는 항상 HTML 모드로 전송되므로 평문 부분(title/note)은 이스케이프.
+    # 출처 링크는 <code>로 감싸 '탭하면 복사'되게 함.
     parts = []
     if urgent:
         parts.append("🚨🚨🚨 긴급 콘텐츠 🚨🚨🚨")
         parts.append("")
-    parts.append(f"📅 {title}")
+    parts.append(f"📅 {html_escape(title)}")
     if media_count > 1:
         label = "미디어" if has_video else "사진"
         parts.append(f"🖼 {label} {media_count}개")
     if note:
-        parts.append(f"📝 {note}")
+        parts.append(f"📝 {html_escape(note)}")
     if link:
-        parts.append(f"🔗 {link}")
+        # 탭하면 URL만 정확히 복사되도록 링크를 별도 줄 <code>로
+        parts.append("📋 출처(탭하면 복사):")
+        parts.append(f"<code>{html_escape(link)}</code>")
     return "\n".join(parts)
 
 
@@ -1404,17 +1408,13 @@ def send_card(chat_id, media_items, caption_body, page_id, reply_to_message_id=N
     if footer is None:
         footer = "⚡ 즉시 인스타 업로드 후 버튼 눌러주세요👇" if urgent else "인스타에 올린 후 아래 버튼 눌러주세요👇"
 
-    # 긴급일 경우 캡션 안에 멘션 임베드
-    parse_mode = None
+    # 캡션은 build_card_caption에서 이미 HTML(제목/비고 이스케이프, 출처는 <code>)로 생성됨.
+    # → 모든 카드를 HTML 모드로 전송해 출처 탭-복사를 활성화. footer는 평문이라 여기서 이스케이프.
+    parse_mode = "HTML"
+    footer = html_escape(footer)
     if urgent:
-        # 캡션을 HTML로 보내야 멘션 작동. 기존 캡션 HTML 이스케이프 처리.
-        from html import escape as _escape
-        escaped_caption = _escape(caption_body)
-        escaped_footer = _escape(footer)
         mention = f'<a href="tg://user?id={UPLOADER_USER_ID}">⚡ Song Won</a>님 즉시 확인!'
-        caption_body = f"{escaped_caption}\n\n{mention}"
-        footer = escaped_footer
-        parse_mode = "HTML"
+        caption_body = f"{caption_body}\n\n{mention}"
 
     sent_ids = []
     if media_count > 1:
